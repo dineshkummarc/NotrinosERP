@@ -19,11 +19,12 @@
  * @param int    $user_id            User performing the action
  * @param int    $level              Approval level at which action occurred
  * @param string $comments           Action comments/reason
- * @param string $draft_data_snapshot JSON snapshot if draft was edited (null otherwise)
- * @return int   Inserted action ID
+ * @param string $draft_data_snapshot JSON edit snapshot or registered source receipt (null otherwise)
+ * @param string|null $error_message Error context; null lets the owning command handle failure.
+ * @return int|false Inserted action ID, or false on a caller-handled query failure
  */
 function add_approval_action($draft_id, $action_type, $user_id = null, $level = 0,
-	$comments = null, $draft_data_snapshot = null)
+	$comments = null, $draft_data_snapshot = null, $error_message = 'could not record approval action')
 {
 	if ($user_id === null)
 		$user_id = $_SESSION['wa_current_user']->user;
@@ -43,7 +44,8 @@ function add_approval_action($draft_id, $action_type, $user_id = null, $level = 
 		. "NOW(), "
 		. db_escape($ip_address) . ")";
 
-	db_query($sql, 'could not record approval action');
+	if (!db_query($sql, $error_message))
+		return false;
 
 	return db_insert_id();
 }
@@ -180,10 +182,13 @@ function deactivate_approval_delegation($delegation_id)
  *
  * @param int $to_user_id User ID receiving delegations
  * @param int $trans_type  Optional transaction type filter
+ * @param bool $lock_policy Lock current delegation rows in an owning transaction
  * @return resource         DB result set
  */
-function get_active_delegations_to_user($to_user_id, $trans_type = null)
+function get_active_delegations_to_user($to_user_id, $trans_type = null, $lock_policy = false)
 {
+	if ($lock_policy && empty($GLOBALS['transaction_level']))
+		throw new RuntimeException('Current approval delegation requires an owning transaction.');
 	$sql = "SELECT d.*, u.real_name AS from_user_name
 		FROM " . TB_PREF . "approval_delegations d
 		LEFT JOIN " . TB_PREF . "users u ON u.id = d.from_user_id
@@ -194,6 +199,7 @@ function get_active_delegations_to_user($to_user_id, $trans_type = null)
 
 	if ($trans_type !== null)
 		$sql .= " AND (d.trans_type IS NULL OR d.trans_type = " . db_escape($trans_type) . ")";
+	if ($lock_policy) $sql .= ' ORDER BY d.id FOR UPDATE';
 
 	return db_query($sql, 'could not retrieve active delegations');
 }

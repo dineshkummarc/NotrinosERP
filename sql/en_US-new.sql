@@ -893,14 +893,14 @@ CREATE TABLE `0_debtors_master` (
 	`notes` tinytext NOT NULL,
 	`inactive` tinyint(1) NOT NULL DEFAULT '0',
 	`custom_data` JSON NOT NULL DEFAULT ('{}'),
-	`credit_insurance_limit` double NOT NULL DEFAULT '0',
+	`credit_insurance_limit` double DEFAULT 0,
 	`credit_review_date` date DEFAULT NULL,
-	`credit_risk_score` enum('low','medium','high','critical') NOT NULL DEFAULT 'medium',
-	`payment_behavior_score` double NOT NULL DEFAULT '0',
-	`customer_tier` enum('standard','silver','gold','platinum','vip') NOT NULL DEFAULT 'standard',
-	`preferred_communication` enum('email','phone','whatsapp','portal') NOT NULL DEFAULT 'email',
-	`industry` varchar(50) NOT NULL DEFAULT '',
-	`company_size` enum('small','medium','large','enterprise') NOT NULL DEFAULT 'medium',
+	`credit_risk_score` enum('low','medium','high','critical') COLLATE utf8_unicode_ci DEFAULT 'medium',
+	`payment_behavior_score` double DEFAULT 0,
+	`customer_tier` enum('standard','silver','gold','platinum','vip') COLLATE utf8_unicode_ci DEFAULT 'standard',
+	`preferred_communication` enum('email','phone','whatsapp','portal') COLLATE utf8_unicode_ci DEFAULT 'email',
+	`industry` varchar(50) COLLATE utf8_unicode_ci DEFAULT '',
+	`company_size` enum('small','medium','large','enterprise') COLLATE utf8_unicode_ci DEFAULT 'medium',
 	PRIMARY KEY (`debtor_no`),
 	UNIQUE KEY `debtor_ref` (`debtor_ref`),
 	KEY `name` (`name`)
@@ -1942,7 +1942,7 @@ CREATE TABLE `0_grn_items` (
 	`serial_numbers_json` text DEFAULT NULL COMMENT 'JSON array of serial numbers received for this line',
 	`expiry_date` date DEFAULT NULL COMMENT 'Expiry date of received goods',
 	`manufacturing_date` date DEFAULT NULL COMMENT 'Manufacturing date of received goods',
-	`inspection_status` varchar(20) DEFAULT 'none' COMMENT 'none|pending|pass|fail',
+	`inspection_status` varchar(20) COLLATE utf8_unicode_ci DEFAULT 'none' COMMENT 'none|pending|pass|fail',
 	PRIMARY KEY (`id`),
 	KEY `grn_batch_id` (`grn_batch_id`)
 ) ENGINE=InnoDB;
@@ -2088,7 +2088,8 @@ CREATE TABLE IF NOT EXISTS `0_leave_details` (
 	`approved_by`       varchar(20)  DEFAULT NULL,
 	`approved_date`     date         DEFAULT NULL,
 	`reason`            text,
-	PRIMARY KEY (`id`)
+	PRIMARY KEY (`id`),
+	KEY `leave_employee_history_idx` (`employee_id`,`id`,`from_date`,`to_date`)
 ) ENGINE=InnoDB;
 
 -- Data of table `0_leave_details` --
@@ -2662,12 +2663,12 @@ CREATE TABLE `0_sales_orders` (
 	`total` double NOT NULL DEFAULT '0',
 	`prep_amount` double NOT NULL DEFAULT '0',
 	`alloc` double NOT NULL DEFAULT '0',
-	`template_id` int(11) NOT NULL DEFAULT '0',
+	`template_id` int(11) DEFAULT 0,
 	`validity_date` date DEFAULT NULL,
-	`opportunity_id` int(11) NOT NULL DEFAULT '0',
+	`opportunity_id` int(11) DEFAULT 0,
 	`terms_and_conditions` text DEFAULT NULL,
-	`margin_total` double NOT NULL DEFAULT '0',
-	`cost_total` double NOT NULL DEFAULT '0',
+	`margin_total` double DEFAULT 0,
+	`cost_total` double DEFAULT 0,
 	`agreement_id` int(11) NOT NULL DEFAULT '0',
 	`custom_data` JSON NOT NULL DEFAULT ('{}'),
 	PRIMARY KEY (`trans_type`,`order_no`)
@@ -2733,13 +2734,13 @@ CREATE TABLE `0_sales_quotation_templates` (
 	`id` int(11) NOT NULL AUTO_INCREMENT,
 	`name` varchar(100) NOT NULL,
 	`description` tinytext,
-	`validity_days` int(11) NOT NULL DEFAULT '30',
+	`validity_days` int(11) DEFAULT 30,
 	`terms_and_conditions` text,
 	`notes` text,
-	`sales_type` int(11) NOT NULL DEFAULT '0',
-	`default_payment_terms` int(11) NOT NULL DEFAULT '0',
-	`default_ship_via` int(11) NOT NULL DEFAULT '0',
-	`inactive` tinyint(1) NOT NULL DEFAULT '0',
+	`sales_type` int(11) DEFAULT 0,
+	`default_payment_terms` int(11) DEFAULT 0,
+	`default_ship_via` int(11) DEFAULT 0,
+	`inactive` tinyint(1) DEFAULT 0,
 	`custom_data` longtext,
 	PRIMARY KEY (`id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8;
@@ -2753,13 +2754,13 @@ DROP TABLE IF EXISTS `0_sales_quotation_template_lines`;
 CREATE TABLE `0_sales_quotation_template_lines` (
 	`id` int(11) NOT NULL AUTO_INCREMENT,
 	`template_id` int(11) NOT NULL,
-	`line_type` enum('product','section','note','optional') NOT NULL DEFAULT 'product',
-	`stock_id` varchar(20) NOT NULL DEFAULT '',
+	`line_type` enum('product','section','note','optional') DEFAULT 'product',
+	`stock_id` varchar(20) DEFAULT '',
 	`description` tinytext,
-	`quantity` double NOT NULL DEFAULT '1',
-	`discount_percent` double NOT NULL DEFAULT '0',
-	`is_optional` tinyint(1) NOT NULL DEFAULT '0',
-	`sort_order` int(11) NOT NULL DEFAULT '0',
+	`quantity` double DEFAULT 1,
+	`discount_percent` double DEFAULT 0,
+	`is_optional` tinyint(1) DEFAULT 0,
+	`sort_order` int(11) DEFAULT 0,
 	`custom_data` longtext,
 	PRIMARY KEY (`id`),
 	KEY `idx_template` (`template_id`)
@@ -2773,14 +2774,14 @@ DROP TABLE IF EXISTS `0_sales_agreements`;
 
 CREATE TABLE `0_sales_agreements` (
 	`id` int(11) NOT NULL AUTO_INCREMENT,
-	`reference` varchar(30) NOT NULL DEFAULT '',
+	`reference` varchar(60) COLLATE utf8_unicode_ci NOT NULL DEFAULT '',
 	`agreement_type` enum('blanket_order','framework_agreement','contract') NOT NULL DEFAULT 'blanket_order',
 	`debtor_no` int(11) NOT NULL,
 	`branch_code` int(11) NOT NULL DEFAULT '0',
 	`salesman_id` int(11) NOT NULL DEFAULT '0',
 	`status` enum('draft','confirmed','active','expired','cancelled') NOT NULL DEFAULT 'draft',
 	`date_start` date NOT NULL,
-	`date_end` date NOT NULL,
+	`date_end` date DEFAULT NULL,
 	`currency` char(3) NOT NULL DEFAULT '',
 	`payment_terms` int(11) NOT NULL DEFAULT '0',
 	`total_committed` double NOT NULL DEFAULT '0',
@@ -2790,13 +2791,13 @@ CREATE TABLE `0_sales_agreements` (
 	`auto_renew` tinyint(1) NOT NULL DEFAULT '0',
 	`renewal_period_months` int(11) NOT NULL DEFAULT '12',
 	`terms_and_conditions` text DEFAULT NULL,
-	`notes` text DEFAULT NULL,
+	`notes` text COLLATE utf8_unicode_ci DEFAULT NULL,
 	`dimension_id` int(11) NOT NULL DEFAULT '0',
 	`dimension2_id` int(11) NOT NULL DEFAULT '0',
 	`created_by` int(11) NOT NULL DEFAULT '0',
-	`created_date` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	`created_date` datetime NULL DEFAULT CURRENT_TIMESTAMP,
 	`inactive` tinyint(1) NOT NULL DEFAULT '0',
-	`custom_data` text DEFAULT NULL,
+	`custom_data` longtext COLLATE utf8_unicode_ci DEFAULT NULL,
 	PRIMARY KEY (`id`),
 	KEY `idx_debtor` (`debtor_no`),
 	KEY `idx_status` (`status`),
@@ -2809,7 +2810,8 @@ CREATE TABLE `0_sales_agreements` (
 
 DROP TABLE IF EXISTS `0_sales_agreement_lines`;
 
-CREATE TABLE `0_sales_agreement_lines` (
+-- Release gap reconciliation: 0_sales_agreement_lines foreign keys are installed by install_constraints.php.
+CREATE TABLE `0_sales_agreement_lines` (	`min_qty_per_order` double NOT NULL DEFAULT 0,
 	`id` int(11) NOT NULL AUTO_INCREMENT,
 	`agreement_id` int(11) NOT NULL,
 	`stock_id` varchar(20) CHARACTER SET utf8 COLLATE utf8_unicode_ci NOT NULL DEFAULT '',
@@ -2821,9 +2823,10 @@ CREATE TABLE `0_sales_agreement_lines` (
 	`unit_price` double NOT NULL DEFAULT '0',
 	`discount_percent` double NOT NULL DEFAULT '0',
 	`price_valid_until` date DEFAULT NULL,
-	`custom_data` text DEFAULT NULL,
+	`custom_data` longtext COLLATE utf8_unicode_ci DEFAULT NULL,
 	PRIMARY KEY (`id`),
-	KEY `idx_agreement_id` (`agreement_id`)
+	KEY `idx_agreement_id` (`agreement_id`),
+	KEY `idx_stock` (`stock_id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8 COLLATE=utf8_unicode_ci;
 
 -- Data of table `0_sales_agreement_lines` --
@@ -3427,6 +3430,7 @@ CREATE TABLE `0_wh_storage_categories` (
 
 DROP TABLE IF EXISTS `0_wh_locations`;
 
+-- Release gap reconciliation: 0_wh_locations foreign keys are installed by install_constraints.php.
 CREATE TABLE `0_wh_locations` (
 	`loc_id` int(11) NOT NULL AUTO_INCREMENT,
 	`loc_code` varchar(30) NOT NULL,
@@ -3673,6 +3677,7 @@ CREATE TABLE `0_quality_inspections` (
 
 DROP TABLE IF EXISTS `0_quality_inspection_readings`;
 
+-- Release gap reconciliation: 0_quality_inspection_readings foreign keys are installed by install_constraints.php.
 CREATE TABLE `0_quality_inspection_readings` (
 	`id` int(11) NOT NULL AUTO_INCREMENT,
 	`inspection_id` int(11) NOT NULL COMMENT 'FK to quality_inspections.id',
@@ -3729,6 +3734,7 @@ CREATE TABLE `0_warranty_claims` (
 
 DROP TABLE IF EXISTS `0_warranty_claim_parts`;
 
+-- Release gap reconciliation: 0_warranty_claim_parts foreign keys are installed by install_constraints.php.
 CREATE TABLE `0_warranty_claim_parts` (
 	`id` int(11) NOT NULL AUTO_INCREMENT,
 	`claim_id` int(11) NOT NULL COMMENT 'FK to warranty_claims.id',
@@ -3784,6 +3790,7 @@ CREATE TABLE `0_recall_campaigns` (
 
 DROP TABLE IF EXISTS `0_recall_items`;
 
+-- Release gap reconciliation: 0_recall_items foreign keys are installed by install_constraints.php.
 CREATE TABLE `0_recall_items` (
 	`id` int(11) NOT NULL AUTO_INCREMENT,
 	`recall_id` int(11) NOT NULL COMMENT 'FK to recall_campaigns.id',
@@ -3869,6 +3876,7 @@ CREATE TABLE `0_wh_operations` (
 
 DROP TABLE IF EXISTS `0_wh_operation_lines`;
 
+-- Release gap reconciliation: 0_wh_operation_lines foreign keys are installed by install_constraints.php.
 CREATE TABLE `0_wh_operation_lines` (
 	`line_id` int(11) NOT NULL AUTO_INCREMENT,
 	`op_id` int(11) NOT NULL COMMENT 'FK to wh_operations',
@@ -3915,6 +3923,7 @@ CREATE TABLE `0_wh_routes` (
 
 DROP TABLE IF EXISTS `0_wh_route_rules`;
 
+-- Release gap reconciliation: 0_wh_route_rules foreign keys are installed by install_constraints.php.
 CREATE TABLE `0_wh_route_rules` (
 	`rule_id` int(11) NOT NULL AUTO_INCREMENT,
 	`route_id` int(11) NOT NULL COMMENT 'FK to wh_routes',
@@ -4016,6 +4025,7 @@ CREATE TABLE `0_wh_transfer_orders` (
 
 DROP TABLE IF EXISTS `0_wh_transfer_order_lines`;
 
+-- Release gap reconciliation: 0_wh_transfer_order_lines foreign keys are installed by install_constraints.php.
 CREATE TABLE `0_wh_transfer_order_lines` (
 	`line_id` int(11) NOT NULL AUTO_INCREMENT,
 	`transfer_id` int(11) NOT NULL,
@@ -4071,6 +4081,7 @@ CREATE TABLE `0_wh_material_requests` (
 
 DROP TABLE IF EXISTS `0_wh_material_request_lines`;
 
+-- Release gap reconciliation: 0_wh_material_request_lines foreign keys are installed by install_constraints.php.
 CREATE TABLE `0_wh_material_request_lines` (
 	`line_id` int(11) NOT NULL AUTO_INCREMENT,
 	`request_id` int(11) NOT NULL,
@@ -4143,6 +4154,7 @@ CREATE TABLE `0_wh_packages` (
 
 DROP TABLE IF EXISTS `0_wh_package_contents`;
 
+-- Release gap reconciliation: 0_wh_package_contents foreign keys are installed by install_constraints.php.
 CREATE TABLE `0_wh_package_contents` (
 	`id` int(11) NOT NULL AUTO_INCREMENT,
 	`package_id` int(11) NOT NULL,
@@ -4205,6 +4217,7 @@ CREATE TABLE `0_wh_cycle_counts` (
 
 DROP TABLE IF EXISTS `0_wh_cycle_count_lines`;
 
+-- Release gap reconciliation: 0_wh_cycle_count_lines foreign keys are installed by install_constraints.php.
 CREATE TABLE `0_wh_cycle_count_lines` (
 	`line_id` int(11) NOT NULL AUTO_INCREMENT,
 	`count_id` int(11) NOT NULL,
@@ -4234,7 +4247,7 @@ CREATE TABLE `0_wh_scrap` (
 	`scrap_date` date NOT NULL,
 	`stock_id` varchar(20) NOT NULL,
 	`qty` decimal(15,4) NOT NULL,
-	`from_loc_id` int(11) NOT NULL COMMENT 'Source bin',
+	`from_loc_id` int(11) DEFAULT NULL,
 	`scrap_loc_id` int(11) DEFAULT NULL COMMENT 'Scrap destination',
 	`reason_code` varchar(20) NOT NULL COMMENT 'damaged|expired|quality_fail|obsolete|other',
 	`reason_detail` varchar(255) DEFAULT NULL,
@@ -4289,6 +4302,7 @@ CREATE TABLE `0_wh_return_orders` (
 
 DROP TABLE IF EXISTS `0_wh_return_order_lines`;
 
+-- Release gap reconciliation: 0_wh_return_order_lines foreign keys are installed by install_constraints.php.
 CREATE TABLE `0_wh_return_order_lines` (
 	`line_id` int(11) NOT NULL AUTO_INCREMENT,
 	`return_id` int(11) NOT NULL,
@@ -4355,7 +4369,7 @@ CREATE TABLE `0_wh_consignment_movements` (
 	`invoiced` tinyint(1) NOT NULL DEFAULT '0' COMMENT '1 if covered by AP invoice',
 	`invoice_trans_no` int(11) DEFAULT NULL COMMENT 'Linked supplier invoice trans_no',
 	`created_by` int(11) DEFAULT NULL,
-	`created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	`created_at` datetime NOT NULL DEFAULT current_timestamp(),
 	PRIMARY KEY (`id`),
 	KEY `consignment_id` (`consignment_id`),
 	KEY `movement_type` (`movement_type`),
@@ -4376,8 +4390,8 @@ CREATE TABLE `0_wh_vmi_levels` (
 	`max_level` decimal(15,4) NOT NULL DEFAULT '0.0000' COMMENT 'Maximum stock level',
 	`reorder_qty` decimal(15,4) NOT NULL DEFAULT '0.0000' COMMENT 'Suggested reorder quantity',
 	`loc_code` varchar(5) DEFAULT NULL COMMENT 'Location code for level tracking',
-	`created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
-	`updated_at` datetime DEFAULT NULL ON UPDATE CURRENT_TIMESTAMP,
+	`created_at` datetime NOT NULL DEFAULT current_timestamp(),
+	`updated_at` datetime DEFAULT NULL ON UPDATE current_timestamp(),
 	PRIMARY KEY (`id`),
 	UNIQUE KEY `uk_item_supplier` (`stock_id`, `supplier_id`),
 	KEY `supplier_id` (`supplier_id`)
@@ -4421,6 +4435,7 @@ CREATE TABLE `0_wh_replenishment_rules` (
 
 DROP TABLE IF EXISTS `0_wh_bin_stock`;
 
+-- Release gap reconciliation: 0_wh_bin_stock foreign keys are installed by install_constraints.php.
 CREATE TABLE `0_wh_bin_stock` (
 	`id` int(11) NOT NULL AUTO_INCREMENT,
 	`wh_loc_id` int(11) NOT NULL COMMENT 'FK to wh_locations.loc_id (bin)',
@@ -4470,7 +4485,7 @@ CREATE TABLE `0_warranty_provision_log` (
 	`dimension2_id` int(11) NOT NULL DEFAULT '0',
 	`notes` text DEFAULT NULL,
 	`created_by` int(11) DEFAULT NULL,
-	`created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	`created_at` datetime NOT NULL DEFAULT current_timestamp(),
 	PRIMARY KEY (`id`),
 	KEY `idx_wp_trans` (`trans_type`, `trans_no`),
 	KEY `idx_wp_stock` (`stock_id`),
@@ -4833,7 +4848,7 @@ INSERT INTO `0_sys_prefs` VALUES
 ('default_inv_sales_act', 'glsetup.items', 'varchar', '15', '4010'),
 ('default_wip_act', 'glsetup.items', 'varchar', '15', '1530'),
 ('default_workorder_required', 'glsetup.manuf', 'int', '11', '20'),
-('version_id', 'system', 'varchar', '11', '1.0'),
+('version_id', 'system', 'varchar', '11', '1.1.0'),
 ('auto_curr_reval', 'setup.company', 'smallint', '6', '1'),
 ('grn_clearing_act', 'glsetup.purchase', 'varchar', '15', '1550'),
 ('bcc_email', 'setup.company', 'varchar', '100', ''),
@@ -7137,7 +7152,7 @@ CREATE TABLE `0_crm_leads` (
 -- ================================================================
 
 DROP TABLE IF EXISTS `0_crm_activities`;
-CREATE TABLE `0_crm_activities` (
+CREATE TABLE `0_crm_activities` (	`priority` tinyint(1) NOT NULL DEFAULT 0,
   `id` int(11) NOT NULL AUTO_INCREMENT,
   `entity_type` varchar(20) NOT NULL DEFAULT 'lead' COMMENT 'lead, contact, customer',
   `entity_id` int(11) NOT NULL,
@@ -7381,12 +7396,7 @@ SET @old_foreign_key_checks = @@FOREIGN_KEY_CHECKS;
 SET FOREIGN_KEY_CHECKS = 0;
 
 
--- Indexes for new stock_moves columns (use CREATE INDEX IF NOT EXISTS alternative)
--- MariaDB 10.5+ supports this syntax
-CREATE INDEX IF NOT EXISTS `idx_sm_serial_id`   ON `0_stock_moves` (`serial_id`);
-CREATE INDEX IF NOT EXISTS `idx_sm_batch_id`    ON `0_stock_moves` (`batch_id`);
-CREATE INDEX IF NOT EXISTS `idx_sm_from_bin_id` ON `0_stock_moves` (`from_bin_id`);
-CREATE INDEX IF NOT EXISTS `idx_sm_to_bin_id`   ON `0_stock_moves` (`to_bin_id`);
+-- Stock move tracking indexes are defined in CREATE TABLE above.
 
 -- -------------------------------------------------------------------------------------
 -- Restore foreign key checks
@@ -12459,7 +12469,7 @@ INSERT INTO `0_pay_ctry_capability_contract_definitions` (`registry_version_id`,
 INSERT INTO `0_pay_ctry_capability_contract_definitions` (`registry_version_id`,`capability_code`,`namespace`,`semantic`,`cardinality`,`exclusive_group`,`artifact_type`,`host_adapter`,`host_version`,`definition_sha256`,`created_at`) SELECT `registry_version_id`,'jurisdiction.translations','jurisdiction','translations','many',NULL,'translation-xliff','translations.xliff.v1','1.0','638a517e230c41ebcf504e72775159b5f073d6ecf2509bd3d43b7546b7c461a6',NOW() FROM `0_pay_ctry_capability_contract_versions` WHERE `registry_version`='pay-ctry-capabilities-v2';
 INSERT INTO `0_pay_ctry_capability_contract_definitions` (`registry_version_id`,`capability_code`,`namespace`,`semantic`,`cardinality`,`exclusive_group`,`artifact_type`,`host_adapter`,`host_version`,`definition_sha256`,`created_at`) SELECT `registry_version_id`,'jurisdiction.migrations','jurisdiction','migrations','many',NULL,'declarative-json','migrations.review.v1','1.0','3304726fdb5e22e329d3a0217c132b6caca56ace8fc013197bc1ed4e95a3fc8f',NOW() FROM `0_pay_ctry_capability_contract_versions` WHERE `registry_version`='pay-ctry-capabilities-v2';
 INSERT INTO `0_pay_ctry_capability_contract_definitions` (`registry_version_id`,`capability_code`,`namespace`,`semantic`,`cardinality`,`exclusive_group`,`artifact_type`,`host_adapter`,`host_version`,`definition_sha256`,`created_at`) SELECT `registry_version_id`,'jurisdiction.tests','jurisdiction','tests','many',NULL,'test-fixture-json','tests.conformance.v1','1.0','74aaf06c3c2458c9beddd6db01f7c03846e54b322ba3810516d8dec64efaaa58',NOW() FROM `0_pay_ctry_capability_contract_versions` WHERE `registry_version`='pay-ctry-capabilities-v2';
-INSERT INTO `0_pay_ctry_host_adapters` (`adapter_code`,`adapter_version`,`media_types_json`,`adapter_sha256`,`status`,`created_at`) VALUES ('core.metadata.v1','1.0','["declarative-json"]','9b83f2f9e4d93b4788f11f1330bb15570fcdd70d71799eee2b0082ff5e8aec9b','active',NOW()),('formula.variables.v1','1.0','["declarative-json"]','83c4c6dc5392a3cec3d91b1e0105c8a7b0526c721a336a0eaaa2cfc8c1721025','active',NOW()),('rules.declarative.v1','1.0','["declarative-json"]','93e3ef03c1563a811581cae5d0a3e1254b4611c7b513cdad1b22f9a230d7cbc6','active',NOW()),('decisions.rates.v1','1.0','["declarative-json"]','219db4616ec0e955c5fc2ae0e227c903c4aa8a47432c7596fd09c05db3d25eee','active',NOW()),('balances.ledger.v1','1.0','["declarative-json"]','1fbe7da8a06802d7bd5bceaf12640549d910ec78d3d9d106eb9d4f462c0eef','active',NOW()),('validators.declarative.v1','1.0','["declarative-json"]','7aeeebc292abc5f3caa83d8d49929e04f193608b36b63d0e5034f1f05a69a888','active',NOW()),('payslips.projection.v1','1.0','["declarative-json"]','0416d7b37251d43dfcc2c3c3f412f577821597465c2d2eb0926833110daf47f8','active',NOW()),('filings.declarative.v1','1.0','["declarative-json"]','861adebd945d285ce09ba6f036125007300fce85e9fed171779b62d0e868bc38','active',NOW()),('bank-files.renderer.v1','1.0','["declarative-json","declarative-csv"]','57afcdde5b667bd35e1a7d6c9ba8a90608912ff8d3e2b03a0b538040c09df6e4','active',NOW()),('translations.xliff.v1','1.0','["translation-xliff"]','9c4df2c1b35f36ea730c62a4fa0e723d0ae56e9726b914efca3c76206f0233ce','active',NOW()),('migrations.review.v1','1.0','["declarative-json"]','f487248eec08bf014988cf34e4f3bf454c5a0d0cfb6475d1c57db14ba2cf8c13','active',NOW()),('tests.conformance.v1','1.0','["test-fixture-json"]','601788eeceaba22ea02f8da559f92db486995f9b4892cff7a22aa0d241b98836','active',NOW());
+INSERT INTO `0_pay_ctry_host_adapters` (`adapter_code`,`adapter_version`,`media_types_json`,`adapter_sha256`,`status`,`created_at`) VALUES ('core.metadata.v1','1.0','["declarative-json"]','9b83f2f9e4d93b4788f11f1330bb15570fcdd70d71799eee2b0082ff5e8aec9b','active',NOW()),('formula.variables.v1','1.0','["declarative-json"]','83c4c6dc5392a3cec3d91b1e0105c8a7b0526c721a336a0eaaa2cfc8c1721025','active',NOW()),('rules.declarative.v1','1.0','["declarative-json"]','93e3ef03c1563a811581cae5d0a3e1254b4611c7b513cdad1b22f9a230d7cbc6','active',NOW()),('decisions.rates.v1','1.0','["declarative-json"]','219db4616ec0e955c5fc2ae0e227c903c4aa8a47432c7596fd09c05db3d25eee','active',NOW()),('balances.ledger.v1','1.0','["declarative-json"]','1fbe7da8a06802d7bd5bceaf12640549d910ec78d3f2d9d106eb9d4f462c0eef','active',NOW()),('validators.declarative.v1','1.0','["declarative-json"]','7aeeebc292abc5f3caa83d8d49929e04f193608b36b63d0e5034f1f05a69a888','active',NOW()),('payslips.projection.v1','1.0','["declarative-json"]','0416d7b37251d43dfcc2c3c3f412f577821597465c2d2eb0926833110daf47f8','active',NOW()),('filings.declarative.v1','1.0','["declarative-json"]','861adebd945d285ce09ba6f036125007300fce85e9fed171779b62d0e868bc38','active',NOW()),('bank-files.renderer.v1','1.0','["declarative-json","declarative-csv"]','57afcdde5b667bd35e1a7d6c9ba8a90608912ff8d3e2b03a0b538040c09df6e4','active',NOW()),('translations.xliff.v1','1.0','["translation-xliff"]','9c4df2c1b35f36ea730c62a4fa0e723d0ae56e9726b914efca3c76206f0233ce','active',NOW()),('migrations.review.v1','1.0','["declarative-json"]','f487248eec08bf014988cf34e4f3bf454c5a0d0cfb6475d1c57db14ba2cf8c13','active',NOW()),('tests.conformance.v1','1.0','["test-fixture-json"]','601788eeceaba22ea02f8da559f92db486995f9b4892cff7a22aa0d241b98836','active',NOW());
 
 -- PAY-CTRY-004 GROUP evidence
 CREATE TABLE IF NOT EXISTS `0_pay_ctry_evidence_sources` (
@@ -15846,3 +15856,237 @@ CREATE TABLE IF NOT EXISTS `0_hrm_pay_con_001_provider_admission_reviews` (
 CREATE TRIGGER `0_pcon1_par_u` BEFORE UPDATE ON `0_hrm_pay_con_001_provider_admission_reviews` FOR EACH ROW SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='PAY-CON-001 immutable hrm_pay_con_001_provider_admission_reviews row cannot be updated';
 CREATE TRIGGER `0_pcon1_par_d` BEFORE DELETE ON `0_hrm_pay_con_001_provider_admission_reviews` FOR EACH ROW SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='PAY-CON-001 immutable hrm_pay_con_001_provider_admission_reviews row cannot be deleted';
 -- PAY-CON-001 END GROUP provider_admission_review_custody
+
+-- PAY-GLB-001 S39 native immutable custody; 1.0.1066 -> 1.0.1067.
+-- Zero seed. No native producer, payroll business approval or financial writer.
+
+CREATE TABLE `0_hrm_pay_glb_001_native_executions` (
+  `native_execution_id` bigint unsigned NOT NULL AUTO_INCREMENT,
+  `company_id` int unsigned NOT NULL,
+  `legal_entity_id` int unsigned NOT NULL,
+  `payroll_group_id` bigint unsigned NOT NULL,
+  `group_version_id` bigint unsigned NOT NULL,
+  `payroll_period_id` int unsigned NOT NULL,
+  `calendar_period_id` bigint unsigned NOT NULL,
+  `source_kind` varchar(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  `producer_contract_version` varchar(48) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  `producer_event_sha256` char(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  `request_sha256` char(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  `native_execution_key` varchar(128) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  `revision_no` bigint unsigned NOT NULL,
+  `predecessor_execution_id` bigint unsigned NULL,
+  `joint_core009_run_id` bigint unsigned NULL,
+  `joint_core009_state_version` bigint unsigned NULL,
+  `joint_core009_state_sha256` char(64) CHARACTER SET ascii COLLATE ascii_bin NULL,
+  `joint_producer_sha256` char(64) CHARACTER SET ascii COLLATE ascii_bin NULL,
+  `member_count` int unsigned NOT NULL,
+  `member_set_sha256` char(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  `core010_result_set_sha256` char(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  `gross_8` decimal(38,8) NOT NULL,
+  `deduction_8` decimal(38,8) NOT NULL,
+  `net_8` decimal(38,8) NOT NULL,
+  `currency_code` char(3) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  `maker_id` int unsigned NOT NULL,
+  `produced_at_utc` datetime NOT NULL,
+  `execution_sha256` char(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  `receipt_json` longtext CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
+  `created_at` timestamp NOT NULL DEFAULT current_timestamp(),
+  PRIMARY KEY (`native_execution_id`),
+  UNIQUE KEY `uq_pgn_e_key` (`native_execution_key`),
+  UNIQUE KEY `uq_pgn_e_sha` (`execution_sha256`),
+  UNIQUE KEY `uq_pgn_e_revision` (`company_id`,`legal_entity_id`,`payroll_group_id`,`payroll_period_id`,`revision_no`),
+  UNIQUE KEY `uq_pgn_e_predecessor` (`predecessor_execution_id`),
+  UNIQUE KEY `uq_pgn_e_joint` (`joint_core009_run_id`),
+  CONSTRAINT `0_fk_pgn_e_predecessor` FOREIGN KEY (`predecessor_execution_id`) REFERENCES `0_hrm_pay_glb_001_native_executions` (`native_execution_id`) ON UPDATE RESTRICT ON DELETE RESTRICT,
+  CONSTRAINT `0_fk_pgn_e_joint` FOREIGN KEY (`joint_core009_run_id`) REFERENCES `0_hrm_pay_core_009_runs` (`run_id`) ON UPDATE RESTRICT ON DELETE RESTRICT,
+  CONSTRAINT `0_ck_pgn_e_0` CHECK (member_count > 0 AND revision_no > 0 AND maker_id > 0),
+  CONSTRAINT `0_ck_pgn_e_1` CHECK (gross_8 - deduction_8 = net_8),
+  CONSTRAINT `0_ck_pgn_e_2` CHECK (source_kind = 'GOVERNED_NATIVE_V1' AND joint_core009_run_id IS NULL AND joint_core009_state_version IS NULL AND joint_core009_state_sha256 IS NULL AND joint_producer_sha256 IS NULL OR source_kind = 'JOINT_CORE009_V1' AND joint_core009_run_id IS NOT NULL AND joint_core009_state_version IS NOT NULL AND joint_core009_state_sha256 IS NOT NULL AND joint_producer_sha256 IS NOT NULL),
+  CONSTRAINT `0_ck_pgn_e_3` CHECK (JSON_VALID(receipt_json))
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+
+CREATE TABLE `0_hrm_pay_glb_001_native_members` (
+  `native_member_id` bigint unsigned NOT NULL AUTO_INCREMENT,
+  `native_execution_id` bigint unsigned NOT NULL,
+  `ordinal_no` int unsigned NOT NULL,
+  `payroll_relationship_id` bigint unsigned NOT NULL,
+  `assignment_id` bigint unsigned NULL,
+  `core004_snapshot_id` bigint unsigned NOT NULL,
+  `core004_result_id` bigint unsigned NOT NULL,
+  `snapshot_sha256` char(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  `result_sha256` char(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  `line_set_sha256` char(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  `trace_set_sha256` char(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  `joint_core009_run_item_id` bigint unsigned NULL,
+  `joint_core009_document_sha256` char(64) CHARACTER SET ascii COLLATE ascii_bin NULL,
+  `cross_domain_parity_sha256` char(64) CHARACTER SET ascii COLLATE ascii_bin NULL,
+  `member_sha256` char(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  `receipt_json` longtext CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
+  `created_at` timestamp NOT NULL DEFAULT current_timestamp(),
+  PRIMARY KEY (`native_member_id`),
+  UNIQUE KEY `uq_pgn_m_0` (`native_execution_id`,`ordinal_no`),
+  UNIQUE KEY `uq_pgn_m_1` (`native_execution_id`,`payroll_relationship_id`),
+  UNIQUE KEY `uq_pgn_m_2` (`native_execution_id`,`core004_snapshot_id`),
+  UNIQUE KEY `uq_pgn_m_3` (`native_execution_id`,`core004_result_id`),
+  UNIQUE KEY `uq_pgn_m_4` (`native_execution_id`,`joint_core009_run_item_id`),
+  UNIQUE KEY `uq_pgn_m_sha` (`member_sha256`),
+  KEY `ix_pgn_m_snapshot` (`core004_snapshot_id`),
+  KEY `ix_pgn_m_result` (`core004_result_id`),
+  KEY `ix_pgn_m_item` (`joint_core009_run_item_id`),
+  CONSTRAINT `0_fk_pgn_m_execution` FOREIGN KEY (`native_execution_id`) REFERENCES `0_hrm_pay_glb_001_native_executions` (`native_execution_id`) ON UPDATE RESTRICT ON DELETE RESTRICT,
+  CONSTRAINT `0_fk_pgn_m_snapshot` FOREIGN KEY (`core004_snapshot_id`) REFERENCES `0_hrm_pay_core_004_snapshots` (`snapshot_id`) ON UPDATE RESTRICT ON DELETE RESTRICT,
+  CONSTRAINT `0_fk_pgn_m_result` FOREIGN KEY (`core004_result_id`) REFERENCES `0_hrm_pay_core_004_results` (`result_id`) ON UPDATE RESTRICT ON DELETE RESTRICT,
+  CONSTRAINT `0_fk_pgn_m_item` FOREIGN KEY (`joint_core009_run_item_id`) REFERENCES `0_hrm_pay_core_009_items` (`run_item_id`) ON UPDATE RESTRICT ON DELETE RESTRICT,
+  CONSTRAINT `0_ck_pgn_m_0` CHECK (ordinal_no > 0),
+  CONSTRAINT `0_ck_pgn_m_1` CHECK (joint_core009_run_item_id IS NULL AND joint_core009_document_sha256 IS NULL AND cross_domain_parity_sha256 IS NULL OR joint_core009_run_item_id IS NOT NULL AND joint_core009_document_sha256 IS NOT NULL AND cross_domain_parity_sha256 IS NOT NULL),
+  CONSTRAINT `0_ck_pgn_m_2` CHECK (JSON_VALID(receipt_json))
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+
+CREATE TABLE `0_hrm_pay_glb_001_native_selection_events` (
+  `selection_event_id` bigint unsigned NOT NULL AUTO_INCREMENT,
+  `company_id` int unsigned NOT NULL,
+  `legal_entity_id` int unsigned NOT NULL,
+  `payroll_group_id` bigint unsigned NOT NULL,
+  `group_version_id` bigint unsigned NOT NULL,
+  `payroll_period_id` int unsigned NOT NULL,
+  `calendar_period_id` bigint unsigned NOT NULL,
+  `sequence_no` bigint unsigned NOT NULL,
+  `predecessor_selection_event_id` bigint unsigned NULL,
+  `predecessor_selection_sha256` char(64) CHARACTER SET ascii COLLATE ascii_bin NULL,
+  `event_kind` varchar(16) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  `native_execution_id` bigint unsigned NULL,
+  `reason_code` varchar(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  `maker_id` int unsigned NOT NULL,
+  `checker_id` int unsigned NOT NULL,
+  `command_key_sha256` char(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  `selection_sha256` char(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  `occurred_at_utc` datetime NOT NULL,
+  `receipt_json` longtext CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
+  `created_at` timestamp NOT NULL DEFAULT current_timestamp(),
+  PRIMARY KEY (`selection_event_id`),
+  UNIQUE KEY `uq_pgn_s_seq` (`company_id`,`legal_entity_id`,`payroll_group_id`,`payroll_period_id`,`sequence_no`),
+  UNIQUE KEY `uq_pgn_s_sha` (`selection_sha256`),
+  UNIQUE KEY `uq_pgn_s_cmd` (`company_id`,`legal_entity_id`,`payroll_group_id`,`payroll_period_id`,`command_key_sha256`),
+  UNIQUE KEY `uq_pgn_s_pred` (`predecessor_selection_event_id`),
+  KEY `ix_pgn_s_execution` (`native_execution_id`),
+  CONSTRAINT `0_fk_pgn_s_pred` FOREIGN KEY (`predecessor_selection_event_id`) REFERENCES `0_hrm_pay_glb_001_native_selection_events` (`selection_event_id`) ON UPDATE RESTRICT ON DELETE RESTRICT,
+  CONSTRAINT `0_fk_pgn_s_execution` FOREIGN KEY (`native_execution_id`) REFERENCES `0_hrm_pay_glb_001_native_executions` (`native_execution_id`) ON UPDATE RESTRICT ON DELETE RESTRICT,
+  CONSTRAINT `0_ck_pgn_s_0` CHECK (sequence_no > 0 AND maker_id > 0 AND checker_id > 0 AND maker_id <> checker_id),
+  CONSTRAINT `0_ck_pgn_s_1` CHECK (event_kind = 'select' AND native_execution_id IS NOT NULL OR event_kind IN ('suspend','revoke') AND native_execution_id IS NULL),
+  CONSTRAINT `0_ck_pgn_s_2` CHECK (sequence_no = 1 AND predecessor_selection_event_id IS NULL AND predecessor_selection_sha256 IS NULL OR sequence_no > 1 AND predecessor_selection_event_id IS NOT NULL AND predecessor_selection_sha256 IS NOT NULL),
+  CONSTRAINT `0_ck_pgn_s_3` CHECK (JSON_VALID(receipt_json))
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+
+CREATE TABLE `0_hrm_pay_glb_001_native_approval_bindings` (
+  `approval_binding_id` bigint unsigned NOT NULL AUTO_INCREMENT,
+  `selection_event_id` bigint unsigned NOT NULL,
+  `native_execution_id` bigint unsigned NOT NULL,
+  `approval_intent_id` bigint unsigned NOT NULL,
+  `approval_id` bigint unsigned NOT NULL,
+  `intent_sha256` char(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  `approval_sha256` char(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  `result_set_sha256` char(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  `projection_set_sha256` char(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  `cutover_transition_sha256` char(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  `maker_id` int unsigned NOT NULL,
+  `approver_id` int unsigned NOT NULL,
+  `binder_id` int unsigned NOT NULL,
+  `command_key_sha256` char(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  `binding_sha256` char(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  `receipt_json` longtext CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
+  `created_at` timestamp NOT NULL DEFAULT current_timestamp(),
+  PRIMARY KEY (`approval_binding_id`),
+  UNIQUE KEY `uq_pgn_a_sel` (`selection_event_id`),
+  UNIQUE KEY `uq_pgn_a_approval` (`approval_id`),
+  UNIQUE KEY `uq_pgn_a_sha` (`binding_sha256`),
+  KEY `ix_pgn_a_execution` (`native_execution_id`),
+  KEY `ix_pgn_a_intent` (`approval_intent_id`),
+  KEY `ix_pgn_a_cmd` (`command_key_sha256`),
+  CONSTRAINT `0_fk_pgn_a_sel` FOREIGN KEY (`selection_event_id`) REFERENCES `0_hrm_pay_glb_001_native_selection_events` (`selection_event_id`) ON UPDATE RESTRICT ON DELETE RESTRICT,
+  CONSTRAINT `0_fk_pgn_a_execution` FOREIGN KEY (`native_execution_id`) REFERENCES `0_hrm_pay_glb_001_native_executions` (`native_execution_id`) ON UPDATE RESTRICT ON DELETE RESTRICT,
+  CONSTRAINT `0_fk_pgn_a_intent` FOREIGN KEY (`approval_intent_id`) REFERENCES `0_hrm_pay_core_010_approval_intents` (`approval_intent_id`) ON UPDATE RESTRICT ON DELETE RESTRICT,
+  CONSTRAINT `0_fk_pgn_a_approval` FOREIGN KEY (`approval_id`) REFERENCES `0_hrm_pay_core_010_approvals` (`approval_id`) ON UPDATE RESTRICT ON DELETE RESTRICT,
+  CONSTRAINT `0_ck_pgn_a_0` CHECK (maker_id > 0 AND approver_id > 0 AND binder_id > 0 AND maker_id <> approver_id),
+  CONSTRAINT `0_ck_pgn_a_1` CHECK (JSON_VALID(receipt_json))
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+
+CREATE TABLE `0_hrm_pay_glb_001_native_gl_bindings` (
+  `gl_binding_id` bigint unsigned NOT NULL AUTO_INCREMENT,
+  `approval_binding_id` bigint unsigned NOT NULL,
+  `journal_intent_id` bigint unsigned NOT NULL,
+  `reconciliation_id` bigint unsigned NOT NULL,
+  `review_id` bigint unsigned NOT NULL,
+  `posting_authority_id` bigint unsigned NOT NULL,
+  `posting_id` bigint unsigned NOT NULL,
+  `journal_sha256` char(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  `approval_sha256` char(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  `posting_sha256` char(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  `reconciliation_sha256` char(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  `posting_kind` varchar(8) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  `predecessor_posting_id` bigint unsigned NULL,
+  `native_gl_effect_sha256` char(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  `command_key_sha256` char(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  `gl_binding_sha256` char(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  `bound_by` int unsigned NOT NULL,
+  `receipt_json` longtext CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
+  `created_at` timestamp NOT NULL DEFAULT current_timestamp(),
+  PRIMARY KEY (`gl_binding_id`),
+  UNIQUE KEY `uq_pgn_g_posting` (`posting_id`),
+  UNIQUE KEY `uq_pgn_g_sha` (`gl_binding_sha256`),
+  KEY `ix_pgn_g_approval` (`approval_binding_id`,`posting_id`),
+  KEY `ix_pgn_g_0` (`journal_intent_id`),
+  KEY `ix_pgn_g_1` (`reconciliation_id`),
+  KEY `ix_pgn_g_2` (`review_id`),
+  KEY `ix_pgn_g_3` (`posting_authority_id`),
+  KEY `ix_pgn_g_4` (`predecessor_posting_id`),
+  KEY `ix_pgn_g_5` (`command_key_sha256`),
+  CONSTRAINT `0_fk_pgn_g_approval` FOREIGN KEY (`approval_binding_id`) REFERENCES `0_hrm_pay_glb_001_native_approval_bindings` (`approval_binding_id`) ON UPDATE RESTRICT ON DELETE RESTRICT,
+  CONSTRAINT `0_fk_pgn_g_intent` FOREIGN KEY (`journal_intent_id`) REFERENCES `0_hrm_pay_gl_001_journal_intents` (`journal_intent_id`) ON UPDATE RESTRICT ON DELETE RESTRICT,
+  CONSTRAINT `0_fk_pgn_g_recon` FOREIGN KEY (`reconciliation_id`) REFERENCES `0_hrm_pay_gl_001_reconciliations` (`reconciliation_id`) ON UPDATE RESTRICT ON DELETE RESTRICT,
+  CONSTRAINT `0_fk_pgn_g_review` FOREIGN KEY (`review_id`) REFERENCES `0_hrm_pay_gl_001_reviews` (`review_id`) ON UPDATE RESTRICT ON DELETE RESTRICT,
+  CONSTRAINT `0_fk_pgn_g_authority` FOREIGN KEY (`posting_authority_id`) REFERENCES `0_hrm_pay_gl_001_posting_authorities` (`authority_id`) ON UPDATE RESTRICT ON DELETE RESTRICT,
+  CONSTRAINT `0_fk_pgn_g_posting` FOREIGN KEY (`posting_id`) REFERENCES `0_hrm_pay_gl_001_gl_postings` (`posting_id`) ON UPDATE RESTRICT ON DELETE RESTRICT,
+  CONSTRAINT `0_fk_pgn_g_pred` FOREIGN KEY (`predecessor_posting_id`) REFERENCES `0_hrm_pay_gl_001_gl_postings` (`posting_id`) ON UPDATE RESTRICT ON DELETE RESTRICT,
+  CONSTRAINT `0_ck_pgn_g_0` CHECK (bound_by > 0),
+  CONSTRAINT `0_ck_pgn_g_1` CHECK (posting_kind = 'post' AND predecessor_posting_id IS NULL OR posting_kind IN ('reverse','repost') AND predecessor_posting_id IS NOT NULL),
+  CONSTRAINT `0_ck_pgn_g_2` CHECK (JSON_VALID(receipt_json))
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+
+CREATE TABLE `0_hrm_pay_glb_001_native_command_receipts` (
+  `command_receipt_id` bigint unsigned NOT NULL AUTO_INCREMENT,
+  `company_id` int unsigned NOT NULL,
+  `command_domain` varchar(48) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  `scope_sha256` char(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  `command_key_sha256` char(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  `expected_predecessor_sha256` char(64) CHARACTER SET ascii COLLATE ascii_bin NULL,
+  `request_sha256` char(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  `effect_kind` varchar(48) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  `effect_id` bigint unsigned NOT NULL,
+  `effect_sha256` char(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  `actor_id` int unsigned NOT NULL,
+  `purpose_code` varchar(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  `command_sha256` char(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  `request_context_json` longtext CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
+  `receipt_json` longtext CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
+  `created_at` timestamp NOT NULL DEFAULT current_timestamp(),
+  PRIMARY KEY (`command_receipt_id`),
+  UNIQUE KEY `uq_pgn_c_replay` (`company_id`,`command_domain`,`scope_sha256`,`command_key_sha256`),
+  UNIQUE KEY `uq_pgn_c_sha` (`command_sha256`),
+  KEY `ix_pgn_c_effect` (`effect_kind`,`effect_id`),
+  CONSTRAINT `0_ck_pgn_c_0` CHECK (actor_id > 0 AND effect_id > 0),
+  CONSTRAINT `0_ck_pgn_c_1` CHECK (JSON_VALID(request_context_json)),
+  CONSTRAINT `0_ck_pgn_c_2` CHECK (JSON_VALID(receipt_json))
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+
+CREATE TRIGGER `0_pgn_e_u` BEFORE UPDATE ON `0_hrm_pay_glb_001_native_executions` FOR EACH ROW SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='S39 immutable hrm_pay_glb_001_native_executions UPDATE denied';
+CREATE TRIGGER `0_pgn_e_d` BEFORE DELETE ON `0_hrm_pay_glb_001_native_executions` FOR EACH ROW SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='S39 immutable hrm_pay_glb_001_native_executions DELETE denied';
+CREATE TRIGGER `0_pgn_m_u` BEFORE UPDATE ON `0_hrm_pay_glb_001_native_members` FOR EACH ROW SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='S39 immutable hrm_pay_glb_001_native_members UPDATE denied';
+CREATE TRIGGER `0_pgn_m_d` BEFORE DELETE ON `0_hrm_pay_glb_001_native_members` FOR EACH ROW SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='S39 immutable hrm_pay_glb_001_native_members DELETE denied';
+CREATE TRIGGER `0_pgn_s_u` BEFORE UPDATE ON `0_hrm_pay_glb_001_native_selection_events` FOR EACH ROW SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='S39 immutable hrm_pay_glb_001_native_selection_events UPDATE denied';
+CREATE TRIGGER `0_pgn_s_d` BEFORE DELETE ON `0_hrm_pay_glb_001_native_selection_events` FOR EACH ROW SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='S39 immutable hrm_pay_glb_001_native_selection_events DELETE denied';
+CREATE TRIGGER `0_pgn_a_u` BEFORE UPDATE ON `0_hrm_pay_glb_001_native_approval_bindings` FOR EACH ROW SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='S39 immutable hrm_pay_glb_001_native_approval_bindings UPDATE denied';
+CREATE TRIGGER `0_pgn_a_d` BEFORE DELETE ON `0_hrm_pay_glb_001_native_approval_bindings` FOR EACH ROW SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='S39 immutable hrm_pay_glb_001_native_approval_bindings DELETE denied';
+CREATE TRIGGER `0_pgn_g_u` BEFORE UPDATE ON `0_hrm_pay_glb_001_native_gl_bindings` FOR EACH ROW SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='S39 immutable hrm_pay_glb_001_native_gl_bindings UPDATE denied';
+CREATE TRIGGER `0_pgn_g_d` BEFORE DELETE ON `0_hrm_pay_glb_001_native_gl_bindings` FOR EACH ROW SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='S39 immutable hrm_pay_glb_001_native_gl_bindings DELETE denied';
+CREATE TRIGGER `0_pgn_c_u` BEFORE UPDATE ON `0_hrm_pay_glb_001_native_command_receipts` FOR EACH ROW SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='S39 immutable hrm_pay_glb_001_native_command_receipts UPDATE denied';
+CREATE TRIGGER `0_pgn_c_d` BEFORE DELETE ON `0_hrm_pay_glb_001_native_command_receipts` FOR EACH ROW SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='S39 immutable hrm_pay_glb_001_native_command_receipts DELETE denied';

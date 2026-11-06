@@ -45,6 +45,7 @@ function set_global_connection($company=-1) {
 //DB wrapper functions to change only once for whole application
 
 function db_query($sql, $err_msg=null) {
+	unset($GLOBALS['db_preserved_insert_id']);
 	global $db, $SysPrefs, $sql_queries, $Ajax, $db_connections, $db_last_inserted_id;
 
 	// set current db prefix
@@ -59,10 +60,12 @@ function db_query($sql, $err_msg=null) {
 
 	db_profile(); // mysql profiling
 
-	$retry = MAX_DEADLOCK_RETRY;
+	// The outer transaction owns all validation/writes after a victim rollback.
+	$transaction_owned = !empty($GLOBALS['transaction_level']);
+	$retry = max(1, (int)MAX_DEADLOCK_RETRY);
 	do {
-		$result = mysql_query($db, $sql);
-		if (mysql_errno($db) == 1213) { // deadlock detected
+		$result = mysql_query($sql, $db);
+		if (mysql_errno($db) == 1213 && !$transaction_owned && $retry > 1) {
 			sleep(1);
 			$retry--;
 		}
@@ -73,7 +76,8 @@ function db_query($sql, $err_msg=null) {
 
 	db_profile($sql);
 
-	if($SysPrefs->sql_trail) {
+	// Retain the deadlock errno without a new autocommitted trail write.
+	if($SysPrefs->sql_trail && !($result === false && mysql_errno($db) == 1213)) {
 		$db_last_inserted_id = mysql_insert_id($db);	// preserve in case trail insert is done
 		if ($SysPrefs->select_trail || (strstr($sql, 'SELECT') === false)) {
 			mysql_query(
@@ -165,6 +169,10 @@ function db_error_msg($conn) {
 function db_insert_id() {
 	global $db_last_inserted_id, $SysPrefs, $db;
 
+	$preserved = isset($GLOBALS['db_preserved_insert_id']) ? $GLOBALS['db_preserved_insert_id'] : null;
+	$company = isset($_SESSION['wa_current_user']->cur_con) ? $_SESSION['wa_current_user']->cur_con : 0;
+	if (is_array($preserved) && $preserved['connection'] === $db && $preserved['company'] === $company)
+		return $preserved['identity'];
 	return $SysPrefs->sql_trail ? $db_last_inserted_id : mysql_insert_id($db);
 }
 

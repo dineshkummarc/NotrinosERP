@@ -220,7 +220,7 @@ function restore_items_cart_from_data($data)
  * @param object $cart The Cart instance (sales/includes/cart_class.inc)
  * @return array Plain array representation
  */
-function collect_sales_cart_data($cart)
+function collect_sales_cart_data($cart, $legacy = false)
 {
 	$data = array(
 		'trans_type'         => $cart->trans_type,
@@ -289,6 +289,18 @@ function collect_sales_cart_data($cart)
 		}
 	}
 
+    // Existing factory native-v1 keeps its exact stored wire; new ordinary carts
+    // retain the fields already understood by their native restorer.
+    if (!$legacy) {
+        $data['agreement_id']=isset($cart->agreement_id)?$cart->agreement_id:0;
+        $defaults=array('company'=>null,'company_prefix'=>null,'company_sha256'=>null,'cust_ref'=>'',
+            'template_id'=>0,'validity_date'=>null,'opportunity_id'=>0,'terms_and_conditions'=>'',
+            'margin_total'=>0,'cost_total'=>0,'optional_items'=>array(),'src_docs'=>array());
+        foreach($defaults as $field=>$value)$data[$field]=isset($cart->$field)?$cart->$field:$value;
+        $data['sales_discount_state']=array('coupon_code'=>isset($cart->coupon_code)?(string)$cart->coupon_code:'',
+            'applied_discounts'=>isset($cart->applied_discounts)&&is_array($cart->applied_discounts)?array_values($cart->applied_discounts):array());
+    }
+
 	return $data;
 }
 
@@ -296,11 +308,15 @@ function collect_sales_cart_data($cart)
  * Collect Purchase Order data as a plain array for JSON draft storage.
  *
  * @param object $po The purch_order instance
- * @return array Plain array representation
+ * @return array|false Plain array representation, or false for an unbound/foreign cart
  */
 function collect_purchase_order_data($po)
 {
+	if (!is_object($po) || !method_exists($po, 'is_current_company') || !$po->is_current_company())
+		return false;
 	$data = array(
+		'company'           => $po->company,
+		'company_prefix'    => $po->company_prefix,
 		'trans_type'        => $po->trans_type,
 		'trans_no'          => isset($po->trans_no) ? $po->trans_no : 0,
 		'supplier_id'       => $po->supplier_id,
@@ -328,6 +344,10 @@ function collect_purchase_order_data($po)
 		'prep_amount'       => isset($po->prep_amount) ? $po->prep_amount : 0,
 		'fixed_asset'       => isset($po->fixed_asset) ? $po->fixed_asset : false,
 	);
+	if (isset($po->direct_finance_binding))
+		$data['direct_finance_binding'] = $po->direct_finance_binding;
+	if (isset($po->approval_gross_amount))
+		$data['approval_gross_amount'] = $po->get_trans_total();
 
 	// Collect line items
 	$data['line_items'] = array();

@@ -52,7 +52,7 @@ function get_procurement_plan_line_statuses()
 {
 	return array(
 		'pending' => _('Pending'),
-		'approved' => _('Approved'),
+		'approved' => _('Included in Plan'),
 		'ordered' => _('Ordered'),
 		'skipped' => _('Skipped'),
 	);
@@ -330,8 +330,8 @@ function has_pending_procurement_plan_approval($plan_id)
 		WHERE trans_type = " . ST_PROCUREMENTPLAN . "
 			AND status = " . APPROVAL_STATUS_PENDING . "
 			AND (
-				draft_data LIKE " . db_escape($raw_pattern) . "
-				OR draft_data LIKE " . db_escape($encoded_pattern) . "
+				draft_data LIKE '" . db_escape_function($raw_pattern) . "'
+				OR draft_data LIKE '" . db_escape_function($encoded_pattern) . "'
 			)
 		ORDER BY id DESC LIMIT 1";
 
@@ -504,120 +504,12 @@ function skip_plan_line($line_id, $reason = '')
  */
 function create_pos_from_plan($plan_id)
 {
-	global $Refs;
-
-	$plan = get_procurement_plan($plan_id);
-	if (!$plan || !in_array($plan['status'], array('confirmed', 'in_progress', 'completed')))
-		return array();
-
-	if (has_pending_procurement_plan_approval($plan_id))
-		return array();
-
-	$sql = "SELECT * FROM " . TB_PREF . "procurement_plan_lines
-		WHERE plan_id = " . (int)$plan_id . "
-		AND status = 'approved'
-		AND po_number = 0
-		ORDER BY supplier_id, id";
-	$result = db_query($sql, 'could not retrieve approved procurement plan lines');
-
-	$grouped_lines = array();
-	while ($line = db_fetch($result)) {
-		if ((int)$line['supplier_id'] <= 0 || (float)$line['suggested_order_qty'] <= 0)
-			continue;
-
-		if (!isset($grouped_lines[$line['supplier_id']]))
-			$grouped_lines[$line['supplier_id']] = array();
-
-		$grouped_lines[$line['supplier_id']][] = $line;
-	}
-
-	if (empty($grouped_lines))
-		return array();
-
-	$po_numbers = array();
-	begin_transaction();
-
-	foreach ($grouped_lines as $supplier_id => $supplier_lines) {
-		$purchase_order = new purch_order();
-		$purchase_order->trans_type = ST_PURCHORDER;
-		$purchase_order->orig_order_date = Today();
-		$purchase_order->due_date = Today();
-		$purchase_order->Comments = sprintf(_('Created from Procurement Plan %s'), (int)$plan_id);
-
-		$first_location = '';
-		foreach ($supplier_lines as $line) {
-			if ($line['location'] !== '') {
-				$first_location = $line['location'];
-				break;
-			}
-		}
-		if ($first_location !== '')
-			$purchase_order->Location = $first_location;
-
-		get_supplier_details_to_order($purchase_order, (int)$supplier_id);
-		$purchase_order->reference = $Refs->get_next(ST_PURCHORDER, null, array(
-			'supplier_id' => (int)$supplier_id,
-			'date' => $purchase_order->orig_order_date,
-		));
-
-		foreach ($supplier_lines as $line) {
-			$price = (float)$line['estimated_price'] > 0
-				? (float)$line['estimated_price']
-				: (float)get_purchase_price((int)$supplier_id, $line['stock_id'], (float)$line['suggested_order_qty']);
-
-			$description = isset($line['stock_description']) ? $line['stock_description'] : null;
-			$purchase_order->add_to_order(
-				count($purchase_order->line_items),
-				$line['stock_id'],
-				(float)$line['suggested_order_qty'],
-				$description,
-				$price,
-				null,
-				$purchase_order->due_date,
-				0,
-				0
-			);
-		}
-
-		if (!$purchase_order->order_has_items())
-			continue;
-
-		$po_number = add_po($purchase_order);
-		if (!$po_number)
-			continue;
-
-		$po_numbers[] = (int)$po_number;
-		foreach ($supplier_lines as $line) {
-			$sql = "UPDATE " . TB_PREF . "procurement_plan_lines
-				SET status = 'ordered', po_number = " . (int)$po_number . "
-				WHERE id = " . (int)$line['id'];
-			db_query($sql, 'could not mark procurement plan line as ordered');
-		}
-	}
-
-	if (!empty($po_numbers)) {
-		$sql = "UPDATE " . TB_PREF . "procurement_plan
-			SET status = 'in_progress'
-			WHERE id = " . (int)$plan_id;
-		db_query($sql, 'could not update procurement plan status');
-
-		$sql = "SELECT COUNT(*) AS pending_count FROM " . TB_PREF . "procurement_plan_lines
-			WHERE plan_id = " . (int)$plan_id . "
-			AND status IN ('pending', 'approved')";
-		$result = db_query($sql, 'could not check remaining procurement plan lines');
-		$pending_row = db_fetch($result);
-		if ($pending_row && (int)$pending_row['pending_count'] === 0) {
-			$sql = "UPDATE " . TB_PREF . "procurement_plan
-				SET status = 'completed'
-				WHERE id = " . (int)$plan_id;
-			db_query($sql, 'could not set procurement plan completed status');
-		}
-	}
-
-	commit_transaction();
-	$hook_payload = array('plan_id' => (int)$plan_id, 'po_numbers' => $po_numbers);
-	hook_invoke_all('procurement_plan_pos_created', $hook_payload);
-	return $po_numbers;
+	global $path_to_root;
+	include_once($path_to_root.'/purchasing/includes/db/procurement_plan_po_approval_db.inc');
+	$results = submit_plan_purchase_orders($plan_id, true);
+	$numbers = array();
+	if (is_array($results)) foreach ($results as $result) $numbers[] = (int)$result['trans_no'];
+	return $numbers;
 }
 
 /**

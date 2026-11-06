@@ -11,6 +11,7 @@
 ***********************************************************************/
 
 include_once($path_to_root . '/taxes/db/tax_types_entity.inc');
+require_once __DIR__.'/../../../dimensions/includes/dimension_financial_reference_writer.inc';
 
 /*
 *	Base function for adding a GL transaction
@@ -30,10 +31,9 @@ function add_gl_trans($type, $trans_id, $date_, $account, $dimension, $dimension
 	}		
 	else
 		$amount_in_home_currency = round2($amount, user_price_dec());
-	if ($dimension == null || $dimension < 0)
-		$dimension = 0;
-	if ($dimension2 == null || $dimension2 < 0)
-		$dimension2 = 0;
+    $dimension = dimension_writer_reference_id($dimension);
+    $dimension2 = dimension_writer_reference_id($dimension2);
+    if ($dimension === false || $dimension2 === false) dimension_financial_reference_failure();
 	if (isset($SysPrefs->use_audit_trail) && $SysPrefs->use_audit_trail) {
 		if ($memo_ == '' || $memo_ == null)
 			$memo_ = $_SESSION['wa_current_user']->username;
@@ -60,10 +60,14 @@ function add_gl_trans($type, $trans_id, $date_, $account, $dimension, $dimension
 
 	$sql .= ") ";
 
-	if ($err_msg == '')
+	// Explicit null leaves rollback/error handling with the owning command.
+	if ($err_msg === '')
 		$err_msg = 'The GL transaction could not be inserted';
 
-	db_query($sql, $err_msg);
+    dimension_financial_reference_write('gl_trans',null,array('dimension_id'=>$dimension,'dimension2_id'=>$dimension2),
+        function($admitted) use ($sql) {
+            return db_query($sql) ? db_insert_id() : false;
+        });
 	return $amount_in_home_currency;
 }
 
@@ -143,8 +147,16 @@ function get_gl_transactions($from_date, $to_date, $trans_no=0, $account=null, $
 		$sql .= " AND gl.dimension_id = ".($dimension<0 ? 0 : db_escape($dimension));
 	if ($dimension2 != 0)
 		$sql .= " AND gl.dimension2_id = ".($dimension2<0 ? 0 : db_escape($dimension2));
-	if ($filter_type != null)
-		$sql .= " AND gl.type IN (" . $filter_type .")";
+	if ($filter_type !== null) {
+		// Only numeric type lists are allowed; malformed filters must not widen the result.
+		if ((!is_string($filter_type) && !is_int($filter_type))
+			|| !preg_match('/\A[0-9]+(?:\s*,\s*[0-9]+)*\z/', trim((string)$filter_type, " \t\r\n")))
+			$sql .= " AND 1=0";
+		else {
+			$filter_types = array_map('trim', explode(',', (string)$filter_type));
+			$sql .= " AND gl.type IN (".implode(',', array_map('db_escape', $filter_types)).")";
+		}
+	}
 	if ($amount_min != null)
 		$sql .= " AND ABS(gl.amount) >= ABS(".db_escape($amount_min).")";
 	if ($amount_max != null)
@@ -345,31 +357,16 @@ function exists_gl_budget($date_, $account, $dimension, $dimension2) {
 	return (db_num_rows($result) > 0);
 }
 
+/** Save an exact monthly coordinate through the ordinary reference boundary. */
 function add_update_gl_budget_trans($date_, $account, $dimension, $dimension2, $amount) {
-	$date = date2sql($date_);
-
-	if (exists_gl_budget($date, $account, $dimension, $dimension2))
-		$sql = "UPDATE ".TB_PREF."budget_trans SET amount=".db_escape($amount)
-		." WHERE account=".db_escape($account)
-		." AND dimension_id=".db_escape($dimension)
-		." AND dimension2_id=".db_escape($dimension2)
-		." AND tran_date='$date'";
-	else
-		$sql = "INSERT INTO ".TB_PREF."budget_trans (tran_date,
-		account, dimension_id, dimension2_id, amount, memo_) VALUES ('$date',
-		".db_escape($account).", ".db_escape($dimension).", "
-		.db_escape($dimension2).", ".db_escape($amount).", '')";
-
-	db_query($sql, 'The GL budget transaction could not be saved');
+	require_once $GLOBALS['path_to_root'].'/gl/includes/db/gl_budget_writer_db.inc';
+	return dimension_native_budget_write($date_, $account, $dimension, $dimension2, $amount);
 }
 
+/** Remove an exact monthly coordinate only when its retained metadata permits it. */
 function delete_gl_budget_trans($date_, $account, $dimension, $dimension2) {
-
-	$sql = "DELETE FROM ".TB_PREF."budget_trans WHERE account=".db_escape($account)
-	." AND dimension_id=".db_escape($dimension)
-	." AND dimension2_id=".db_escape($dimension2)
-	." AND tran_date='".date2sql($date_)."'";
-	db_query($sql, 'The GL budget transaction could not be deleted');
+	require_once $GLOBALS['path_to_root'].'/gl/includes/db/gl_budget_writer_db.inc';
+	return dimension_native_budget_write($date_, $account, $dimension, $dimension2, null, true);
 }
 
 function get_only_budget_trans_from_to($from_date, $to_date, $account, $dimension=0, $dimension2=0) {
@@ -507,31 +504,21 @@ function exists_gl_trans($type, $trans_id) {
 //--------------------------------------------------------------------------------------------------
 
 function void_gl_trans($type, $trans_id, $nested=false) {
-	if (!$nested)
-		begin_transaction();
-
-	$sql = "UPDATE ".TB_PREF."gl_trans SET amount=0 WHERE type=".db_escape($type)
-	." AND type_no=".db_escape($trans_id);
-
-	db_query($sql, "could not void gl transactions for type=$type and trans_no=$trans_id");
-
-	if (!$nested)
-		commit_transaction();
+    return dimension_financial_reference_group('gl_trans',$type,$trans_id,function($row) {
+        return db_query('UPDATE '.TB_PREF.'gl_trans SET amount=0 WHERE counter='.(int)$row['counter']) !== false;
+    });
 }
 
 //----------------------------------------------------------------------------------------
 
 function clear_gl_trans($type, $trans_id, $nested=false) {
-	if (!$nested)
-		begin_transaction();
-
-	$sql = "DELETE FROM ".TB_PREF."gl_trans WHERE type=".db_escape($type)
-	." AND type_no=".db_escape($trans_id);
-
-	db_query($sql, "could not clear gl transactions for type=$type and trans_no=$trans_id");
-
-	if (!$nested)
-		commit_transaction();
+    return dimension_financial_reference_group('gl_trans',$type,$trans_id,function($row) {
+        foreach (array('warranty_provision_log'=>'gl_trans_id','hrm_pay_gl_001_gl_posting_lines'=>'gl_counter') as $owner=>$column) {
+            $rows=db_query('SELECT '.$column.' FROM '.TB_PREF.$owner.' WHERE '.$column.'='.(int)$row['counter'].' FOR UPDATE');
+            if (!$rows || db_fetch_row($rows)) return false;
+        }
+        return db_query('DELETE FROM '.TB_PREF.'gl_trans WHERE counter='.(int)$row['counter']) !== false;
+    },true);
 }
 
 function get_sql_for_journal_inquiry($filter, $from, $to, $ref='', $memo='', $alsoclosed=false, $login_id=null) {

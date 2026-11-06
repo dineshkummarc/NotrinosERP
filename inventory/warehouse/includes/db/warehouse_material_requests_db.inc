@@ -121,7 +121,8 @@ function material_request_type_badge($type) {
 // =====================================================================
 
 /**
- * Get the next sequential request number.
+ * Preview the next native request number. Construction must use its locked
+ * writer, which also accounts for retained approval/reservation numbers.
  *
  * @return int Next request_no
  */
@@ -156,27 +157,10 @@ function format_material_request_no($request_no) {
 function add_material_request($request_type, $warehouse_loc, $request_date,
 	$required_date = null, $reference = null, $memo = null)
 {
-	$request_no = get_next_material_request_no();
-
-	$sql = "INSERT INTO " . TB_PREF . "wh_material_requests (
-		request_no, request_type, status, warehouse_loc_code,
-		requested_by, request_date, required_date,
-		reference, memo, created_at
-	) VALUES ("
-		. (int)$request_no . ","
-		. db_escape($request_type) . ","
-		. "'draft',"
-		. db_escape($warehouse_loc) . ","
-		. (int)$_SESSION['wa_current_user']->user . ","
-		. db_escape($request_date) . ","
-		. ($required_date ? db_escape($required_date) : 'NULL') . ","
-		. ($reference ? db_escape($reference) : 'NULL') . ","
-		. ($memo ? db_escape($memo) : 'NULL') . ","
-		. "NOW()"
-		. ")";
-
-	db_query($sql, 'could not insert material request');
-	return db_insert_id();
+	global $path_to_root;
+	require_once $path_to_root.'/inventory/warehouse/includes/db/warehouse_material_create_db.inc';
+	return create_material_request_header($request_type, $warehouse_loc, $request_date,
+		$required_date, $reference, $memo);
 }
 
 /**
@@ -194,19 +178,9 @@ function add_material_request($request_type, $warehouse_loc, $request_date,
 function update_material_request($request_id, $request_type, $warehouse_loc,
 	$request_date, $required_date = null, $reference = null, $memo = null)
 {
-	$sql = "UPDATE " . TB_PREF . "wh_material_requests SET "
-		. "request_type = " . db_escape($request_type) . ","
-		. "warehouse_loc_code = " . db_escape($warehouse_loc) . ","
-		. "request_date = " . db_escape($request_date) . ","
-		. "required_date = " . ($required_date ? db_escape($required_date) : 'NULL') . ","
-		. "reference = " . ($reference ? db_escape($reference) : 'NULL') . ","
-		. "memo = " . ($memo ? db_escape($memo) : 'NULL') . ","
-		. "updated_at = NOW()"
-		. " WHERE request_id = " . (int)$request_id
-		. " AND status = 'draft'";
-
-	db_query($sql, 'could not update material request');
-	return db_num_affected_rows() > 0;
+	require_once __DIR__.'/warehouse_material_header_db.inc';
+	return write_standalone_material_header($request_id, $request_type, $warehouse_loc,
+		$request_date, $required_date, $reference, $memo);
 }
 
 /**
@@ -249,19 +223,8 @@ function can_delete_material_request($request_id) {
  * @return bool Success
  */
 function delete_material_request($request_id) {
-	if (!can_delete_material_request($request_id))
-		return false;
-
-	begin_transaction();
-
-	$sql = "DELETE FROM " . TB_PREF . "wh_material_request_lines WHERE request_id = " . (int)$request_id;
-	db_query($sql, 'could not delete material request lines');
-
-	$sql = "DELETE FROM " . TB_PREF . "wh_material_requests WHERE request_id = " . (int)$request_id;
-	db_query($sql, 'could not delete material request');
-
-	commit_transaction();
-	return true;
+	require_once __DIR__.'/warehouse_material_core_db.inc';
+	return delete_standalone_material_core($request_id);
 }
 
 // =====================================================================
@@ -281,19 +244,9 @@ function delete_material_request($request_id) {
 function add_material_request_line($request_id, $stock_id, $qty_requested,
 	$required_date = null, $memo = null)
 {
-	$sql = "INSERT INTO " . TB_PREF . "wh_material_request_lines (
-		request_id, stock_id, qty_requested, qty_fulfilled, required_date, memo
-	) VALUES ("
-		. (int)$request_id . ","
-		. db_escape($stock_id) . ","
-		. db_escape($qty_requested) . ","
-		. "0,"
-		. ($required_date ? db_escape($required_date) : 'NULL') . ","
-		. ($memo ? db_escape($memo) : 'NULL')
-		. ")";
-
-	db_query($sql, 'could not insert material request line');
-	return db_insert_id();
+	require_once __DIR__.'/warehouse_material_line_db.inc';
+	return write_standalone_material_line('add', $request_id, array('stock_id'=>$stock_id,
+		'quantity'=>$qty_requested, 'required_date'=>$required_date, 'memo'=>$memo));
 }
 
 /**
@@ -303,28 +256,25 @@ function add_material_request_line($request_id, $stock_id, $qty_requested,
  * @param float       $qty_requested  Requested quantity
  * @param string|null $required_date  Line-level required date (SQL)
  * @param string|null $memo           Line memo
+ * @param int|null    $request_id     Optional expected parent from the native editor
  * @return bool Success
  */
-function update_material_request_line($line_id, $qty_requested, $required_date = null, $memo = null) {
-	$sql = "UPDATE " . TB_PREF . "wh_material_request_lines SET "
-		. "qty_requested = " . db_escape($qty_requested) . ","
-		. "required_date = " . ($required_date ? db_escape($required_date) : 'NULL') . ","
-		. "memo = " . ($memo ? db_escape($memo) : 'NULL')
-		. " WHERE line_id = " . (int)$line_id;
-
-	db_query($sql, 'could not update material request line');
-	return db_num_affected_rows() > 0;
+function update_material_request_line($line_id, $qty_requested, $required_date = null, $memo = null, $request_id = null) {
+	require_once __DIR__.'/warehouse_material_line_db.inc';
+	return write_standalone_material_line('update', $line_id, array('quantity'=>$qty_requested,
+		'required_date'=>$required_date, 'memo'=>$memo), $request_id);
 }
 
 /**
  * Delete a material request line.
  *
  * @param int $line_id Line ID
- * @return void
+ * @param int|null $request_id Optional expected parent from the native editor
+ * @return bool Success
  */
-function delete_material_request_line($line_id) {
-	$sql = "DELETE FROM " . TB_PREF . "wh_material_request_lines WHERE line_id = " . (int)$line_id;
-	db_query($sql, 'could not delete material request line');
+function delete_material_request_line($line_id, $request_id = null) {
+	require_once __DIR__.'/warehouse_material_line_db.inc';
+	return write_standalone_material_line('delete', $line_id, array(), $request_id);
 }
 
 /**
@@ -379,23 +329,33 @@ function count_material_request_lines($request_id) {
 }
 
 /**
- * Find the latest pending core approval draft for a material request.
+ * Find one exactly identified pending core review. This is a reader, not
+ * authority to approve or recover ambiguous/legacy history.
  *
  * @param int $request_id Request ID
  * @return array|false Draft row or false
  */
 function get_pending_material_request_approval_draft($request_id)
 {
-	$sql = "SELECT d.*
-		FROM " . TB_PREF . "approval_drafts d
-		WHERE d.trans_type = " . db_escape((int)ST_WH_MATERIAL_REQUEST) . "
-		AND d.status = 0
-		AND d.draft_data LIKE " . db_escape('%\"request_id\":' . (int)$request_id . '%') . "
-		ORDER BY d.id DESC
-		LIMIT 1";
-
-	$result = db_query($sql, 'could not get pending material request approval draft');
-	return db_fetch($result);
+	require_once __DIR__.'/warehouse_material_core_db.inc';
+	$context = material_core_context();
+	$identity = dimension_writer_reference_id($request_id);
+	if (!$context || !$identity) return false;
+	$rows = material_core_rows('SELECT * FROM '.TB_PREF.'approval_drafts WHERE trans_type='
+		.ST_WH_MATERIAL_REQUEST.' AND status=0 ORDER BY id');
+	if ($rows === false) return false;
+	$match = false;
+	$approval = get_approval_workflow_service();
+	foreach ($rows as $row) {
+		$data = $approval->decodeStoredDraftData($row['draft_data']);
+		if (!is_array($data) || !isset($data['request_id'])
+			|| !($owner = dimension_writer_reference_id($data['request_id']))) return false;
+		if ($owner !== $identity) continue;
+		if ($match !== false || (isset($data['material_company_sha256'])
+			&& $data['material_company_sha256'] !== material_core_context(true))) return false;
+		$match = $row;
+	}
+	return material_core_context() === $context ? $match : false;
 }
 
 // =====================================================================
@@ -410,22 +370,7 @@ function get_pending_material_request_approval_draft($request_id)
  * @return bool Success
  */
 function submit_material_request($request_id) {
-	$mr = get_material_request($request_id);
-	if (!$mr || $mr['status'] !== 'draft')
-		return false;
-
-	// Must have at least one line
-	if (count_material_request_lines($request_id) == 0)
-		return false;
-
-	$sql = "UPDATE " . TB_PREF . "wh_material_requests SET "
-		. "status = 'submitted',"
-		. "updated_at = NOW()"
-		. " WHERE request_id = " . (int)$request_id
-		. " AND status = 'draft'";
-
-	db_query($sql, 'could not submit material request');
-	return db_num_affected_rows() > 0;
+	return submit_material_request_for_core_approval($request_id) !== false;
 }
 
 /**
@@ -451,7 +396,7 @@ function get_material_request_submission_data($request_id) {
 			'qty_fulfilled' => (float)$line['qty_fulfilled'],
 			'unit_cost' => isset($line['material_cost']) ? (float)$line['material_cost'] : 0,
 			'required_date' => $line['required_date'] ? $line['required_date'] : '',
-			'memo' => $line['memo'] ? $line['memo'] : '',
+			'memo' => $line['memo'] === null ? '' : $line['memo'],
 		);
 	}
 
@@ -472,8 +417,8 @@ function get_material_request_submission_data($request_id) {
 		'requested_by_name' => isset($mr['requested_by_name']) ? $mr['requested_by_name'] : '',
 		'request_date' => $mr['request_date'],
 		'required_date' => $mr['required_date'] ? $mr['required_date'] : '',
-		'reference' => $mr['reference'] ? $mr['reference'] : '',
-		'memo' => $mr['memo'] ? $mr['memo'] : '',
+		'reference' => $mr['reference'] === null ? '' : $mr['reference'],
+		'memo' => $mr['memo'] === null ? '' : $mr['memo'],
 		'total_estimated' => (float)get_material_request_total_value($request_id),
 		'line_count' => count($lines_data),
 		'lines' => $lines_data,
@@ -487,61 +432,8 @@ function get_material_request_submission_data($request_id) {
  * @return array|bool
  */
 function submit_material_request_for_core_approval($request_id) {
-	$mr = get_material_request($request_id);
-	if (!$mr || $mr['status'] !== 'draft')
-		return false;
-
-	if (count_material_request_lines($request_id) == 0)
-		return false;
-
-	$approval_registered = class_exists('ApprovalWorkflow') && ApprovalWorkflow::isRegistered(ST_WH_MATERIAL_REQUEST);
-	$approval_amount = (float)get_material_request_total_value($request_id);
-	$approval_required = false;
-	$approval = null;
-
-	if ($approval_registered) {
-		$approval = get_approval_workflow_service();
-		$approval_required = $approval->isApprovalRequired(ST_WH_MATERIAL_REQUEST, $approval_amount);
-	}
-
-	if (!submit_material_request($request_id))
-		return false;
-
-	if (!$approval_registered || !$approval_required) {
-		if (!approve_material_request($request_id))
-			return false;
-
-		return array('status' => 'auto_approved', 'request_id' => (int)$request_id);
-	}
-
-	$reloaded = get_material_request($request_id);
-	$draft_data = get_material_request_submission_data($request_id);
-	if ($draft_data === false)
-		return false;
-
-	$result = $approval->submit(
-		ST_WH_MATERIAL_REQUEST,
-		$draft_data,
-		$approval_amount,
-		array(
-			'summary' => sprintf(_('Material Request %s'), format_material_request_no($reloaded['request_no'])),
-			'currency' => get_company_pref('curr_default'),
-			'person_type' => PT_MISC,
-			'person_id' => $reloaded['requested_by'],
-			'loc_code' => $reloaded['warehouse_loc_code'],
-		)
-	);
-
-	if (isset($result['status']) && $result['status'] === 'execution_failed') {
-		$sql = "UPDATE " . TB_PREF . "wh_material_requests SET "
-			. "status = 'draft',"
-			. "updated_at = NOW()"
-			. " WHERE request_id = " . (int)$request_id
-			. " AND status = 'submitted'";
-		db_query($sql, 'could not rollback material request to draft after approval execution failure');
-	}
-
-	return $result;
+	require_once __DIR__.'/warehouse_material_core_db.inc';
+	return submit_standalone_material_to_core($request_id);
 }
 
 /**
@@ -552,19 +444,8 @@ function submit_material_request_for_core_approval($request_id) {
  * @return bool Success
  */
 function approve_material_request($request_id) {
-	$mr = get_material_request($request_id);
-	if (!$mr || $mr['status'] !== 'submitted')
-		return false;
-
-	$sql = "UPDATE " . TB_PREF . "wh_material_requests SET "
-		. "status = 'approved',"
-		. "approved_by = " . (int)$_SESSION['wa_current_user']->user . ","
-		. "updated_at = NOW()"
-		. " WHERE request_id = " . (int)$request_id
-		. " AND status = 'submitted'";
-
-	db_query($sql, 'could not approve material request');
-	return db_num_affected_rows() > 0;
+	// Only the registered core executor owns final approval.
+	return false;
 }
 
 /**
@@ -575,18 +456,8 @@ function approve_material_request($request_id) {
  * @return bool Success
  */
 function reject_material_request($request_id) {
-	$mr = get_material_request($request_id);
-	if (!$mr || $mr['status'] !== 'submitted')
-		return false;
-
-	$sql = "UPDATE " . TB_PREF . "wh_material_requests SET "
-		. "status = 'draft',"
-		. "updated_at = NOW()"
-		. " WHERE request_id = " . (int)$request_id
-		. " AND status = 'submitted'";
-
-	db_query($sql, 'could not reject material request');
-	return db_num_affected_rows() > 0;
+	// Only the registered core rejector owns reviewed-source rejection.
+	return false;
 }
 
 /**
@@ -597,27 +468,24 @@ function reject_material_request($request_id) {
  * @return bool Success
  */
 function cancel_material_request($request_id, $comments = '') {
+	require_once __DIR__.'/warehouse_material_core_db.inc';
+	$request_id = dimension_writer_reference_id($request_id);
+	if (!material_core_context() || !$request_id || !is_string($comments) || strpos($comments, "\0") !== false) return false;
 	$mr = get_material_request($request_id);
 	if (!$mr || !in_array($mr['status'], array('draft', 'submitted', 'approved')))
 		return false;
-
-	if ($mr['status'] === 'submitted') {
-		$pending_draft = get_pending_material_request_approval_draft($request_id);
-		if ($pending_draft && function_exists('get_approval_workflow_service')) {
-			$approval = get_approval_workflow_service();
-			$result = $approval->cancel((int)$pending_draft['id'], $comments);
-			return (is_array($result) && isset($result['status']) && $result['status'] !== 'error');
-		}
+	if ($mr['status'] === 'draft') {
+		require_once __DIR__.'/warehouse_material_cancel_db.inc';
+		return cancel_standalone_material_draft($request_id, $comments);
 	}
 
-	$sql = "UPDATE " . TB_PREF . "wh_material_requests SET "
-		. "status = 'cancelled',"
-		. "updated_at = NOW()"
-		. " WHERE request_id = " . (int)$request_id
-		. " AND status IN ('draft', 'submitted', 'approved')";
+	if ($mr['status'] === 'submitted') {
+		require_once __DIR__.'/warehouse_material_core_db.inc';
+		return cancel_standalone_material_core($request_id, $comments);
+	}
 
-	db_query($sql, 'could not cancel material request');
-	return db_num_affected_rows() > 0;
+	require_once __DIR__.'/warehouse_material_terminal_db.inc';
+	return cancel_standalone_material_approved($request_id, $comments);
 }
 
 /**
@@ -625,67 +493,52 @@ function cancel_material_request($request_id, $comments = '') {
  * Transitions: approved → ordered
  *
  * @param int    $request_id    Request ID
- * @param int    $linked_type   Linked document type (ST_PURCHORDER, ST_LOCTRANSFER, ST_WORKORDER)
+ * @param int    $linked_type   Supported native type: ST_PURCHORDER or ST_LOCTRANSFER
  * @param int    $linked_no     Linked document number
+ * @param array  $purchase_snapshot Native paired PO source intent, required for PO linkage
  * @return bool Success
  */
-function mark_material_request_ordered($request_id, $linked_type, $linked_no) {
-	$mr = get_material_request($request_id);
-	if (!$mr || $mr['status'] !== 'approved')
-		return false;
-
-	$sql = "UPDATE " . TB_PREF . "wh_material_requests SET "
-		. "status = 'ordered',"
-		. "linked_doc_type = " . (int)$linked_type . ","
-		. "linked_doc_no = " . (int)$linked_no . ","
-		. "updated_at = NOW()"
-		. " WHERE request_id = " . (int)$request_id
-		. " AND status = 'approved'";
-
-	db_query($sql, 'could not mark material request as ordered');
-	return db_num_affected_rows() > 0;
+function mark_material_request_ordered($request_id, $linked_type, $linked_no, $purchase_snapshot = null) {
+	if (!is_int($linked_type) && !is_string($linked_type)) return false;
+	// Standalone PO conversion owns its separate approved-source receipt path.
+	// A paired PO transition must carry the native writer's actual source intent.
+	if ((string)$linked_type === (string)ST_PURCHORDER) {
+		require_once $GLOBALS['path_to_root'].'/inventory/warehouse/includes/db/warehouse_material_order_db.inc';
+		return link_paired_material_purchase_order($request_id, $linked_no, $purchase_snapshot);
+	}
+	// Numeric Transfer links are not approval or company authority. Require
+	// the transaction's exact standalone source and native draft custody.
+	if ((string)$linked_type === (string)ST_LOCTRANSFER) {
+		require_once __DIR__.'/warehouse_material_transfer_link_db.inc';
+		return link_approved_material_transfer($request_id, $linked_no, $purchase_snapshot);
+	}
+	// No native reviewed source/receipt contract exists for other families.
+	// A numeric document identity cannot stand in for downstream custody.
+	return false;
 }
 
 /**
- * Update fulfillment quantity for a material request line.
+ * Compatibility denial for the former arbitrary fulfillment quantity setter.
+ * Only a native receiving command with stock and approval custody may author
+ * fulfillment. No maintained caller uses this evidence-free legacy setter.
  *
  * @param int   $line_id        Line ID
  * @param float $qty_fulfilled  Total fulfilled quantity
- * @return void
+ * @return bool Always false; no source read or write
  */
 function update_material_request_line_fulfillment($line_id, $qty_fulfilled) {
-	$sql = "UPDATE " . TB_PREF . "wh_material_request_lines SET "
-		. "qty_fulfilled = " . db_escape($qty_fulfilled)
-		. " WHERE line_id = " . (int)$line_id;
-
-	db_query($sql, 'could not update line fulfillment');
+	return false;
 }
 
 /**
- * Check if all lines of a material request are fully fulfilled.
- * If so, automatically transition status to 'fulfilled'.
+ * Compatibility denial for the former quantity-only fulfillment transition.
+ * Matching quantities do not prove an approved downstream receipt. Preserve
+ * historical rows; the read-only fulfillment percentage remains available.
  *
  * @param int $request_id Request ID
- * @return bool True if all lines fulfilled
+ * @return bool Always false; no source read or write
  */
 function check_material_request_fulfillment($request_id) {
-	$sql = "SELECT COUNT(*) AS total,
-		SUM(CASE WHEN qty_fulfilled >= qty_requested THEN 1 ELSE 0 END) AS fulfilled_count
-	FROM " . TB_PREF . "wh_material_request_lines
-	WHERE request_id = " . (int)$request_id;
-
-	$result = db_query($sql, 'could not check fulfillment');
-	$row = db_fetch($result);
-
-	if ($row['total'] > 0 && $row['fulfilled_count'] == $row['total']) {
-		$sql = "UPDATE " . TB_PREF . "wh_material_requests SET "
-			. "status = 'fulfilled',"
-			. "updated_at = NOW()"
-			. " WHERE request_id = " . (int)$request_id
-			. " AND status IN ('ordered', 'approved')";
-		db_query($sql, 'could not mark request as fulfilled');
-		return true;
-	}
 	return false;
 }
 
@@ -694,61 +547,196 @@ function check_material_request_fulfillment($request_id) {
 // =====================================================================
 
 /**
+ * Build the current locked material source and its native zero-price PO intent.
+ * The caller owns a transaction; this helper never consumes a reference or source.
+ * @return array Locked source, source queries and company-bound native cart
+ */
+function prepare_material_request_purchase_order($request_id, $supplier_id, $order_date = null) {
+	if (empty($GLOBALS['transaction_level']) || !isset($_SESSION['wa_current_user'])
+		|| !$_SESSION['wa_current_user']->can_access('SA_MATERIALREQUEST')
+		|| !$_SESSION['wa_current_user']->can_access('SA_PURCHASEORDER')
+		|| !is_scalar($request_id) || (string)(int)$request_id !== (string)$request_id || (int)$request_id <= 0
+		|| !is_scalar($supplier_id) || (string)(int)$supplier_id !== (string)$supplier_id || (int)$supplier_id <= 0)
+		throw new RuntimeException('Material request purchase authority is unavailable.');
+	$cart = new purch_order();
+	if (!$cart->is_current_company())
+		throw new RuntimeException('Material request company is unavailable.');
+	include_once(__DIR__.'/warehouse_material_terminal_db.inc');
+	// Take history before source/children, as native approval and cancellation do.
+	// An old status alone cannot authorize a new downstream command.
+	$custody = material_approved_custody((int)$request_id);
+	if (!$custody)
+		throw new RuntimeException('Material request approved-source custody requires recovery.');
+	// Current locking reads also reject stale outer-transaction snapshots.
+	$source_query = 'SELECT * FROM '.TB_PREF.'wh_material_requests WHERE request_id='.(int)$request_id.' FOR UPDATE';
+	$mr = db_fetch_assoc(db_query($source_query, 'could not lock material request conversion'));
+	if (!$mr || $mr['status'] !== 'approved' || $mr['request_type'] !== 'purchase'
+		|| !empty($mr['linked_doc_no']))
+		throw new RuntimeException('Material request is not available for conversion.');
+	$location = db_fetch_assoc(db_query('SELECT * FROM '.TB_PREF.'locations WHERE loc_code='
+		.db_escape($mr['warehouse_loc_code']).' AND inactive=0 FOR UPDATE', 'could not verify material request location'));
+	$supplier = db_fetch_assoc(db_query('SELECT supplier_id FROM '.TB_PREF.'suppliers WHERE supplier_id='
+		.(int)$supplier_id.' AND inactive=0 FOR UPDATE', 'could not verify material request supplier'));
+	if (!$location || !$supplier)
+		throw new RuntimeException('Material request destination is unavailable.');
+	$cart->trans_type = ST_PURCHORDER;
+	$cart->orig_order_date = $order_date === null ? Today() : $order_date;
+	$cart->due_date = $mr['required_date'] ? sql2date($mr['required_date']) : $cart->orig_order_date;
+	$cart->Location = $location['loc_code'];
+	$cart->delivery_address = $location['delivery_address'] !== '' ? $location['delivery_address'] : $location['location_name'];
+	$cart->Comments = sprintf(_('Created from Material Request %s'), format_material_request_no($mr['request_no']));
+	get_supplier_details_to_order($cart, (int)$supplier_id, true);
+	$cart->reference = 'auto';
+	$line_query = 'SELECT line.*, item.description AS item_description, item.units AS item_units,
+		item.editable AS item_editable, item.tax_type_id AS item_tax_type, tax.name AS item_tax_name,
+		purchase.supplier_description AS supplier_description
+		FROM '.TB_PREF.'wh_material_request_lines line
+		LEFT JOIN '.TB_PREF.'stock_master item ON item.stock_id=line.stock_id
+		LEFT JOIN '.TB_PREF.'item_tax_types tax ON tax.id=item.tax_type_id
+		LEFT JOIN '.TB_PREF.'purch_data purchase ON purchase.stock_id=line.stock_id AND purchase.supplier_id='.(int)$supplier_id.'
+		WHERE line.request_id='.(int)$request_id.' ORDER BY line.line_id FOR UPDATE';
+	$lines = db_query($line_query, 'could not lock material request conversion lines');
+	$source_lines = array();
+	while ($line = db_fetch_assoc($lines)) {
+		$source_lines[] = $line;
+		$outstanding = (float)$line['qty_requested'] - (float)$line['qty_fulfilled'];
+		if (!is_finite($outstanding) || $line['qty_requested'] < 0 || $line['qty_fulfilled'] < 0
+			|| $line['item_description'] === null)
+			throw new RuntimeException('Material request line is unavailable.');
+		if ($outstanding <= 0)
+			continue;
+		// Preserve the existing zero-price conversion policy; price is edited in the PO UI.
+		$cart->add_to_order(count($cart->line_items), $line['stock_id'], $outstanding,
+			$line['item_description'], 0, $line['item_units'],
+			$line['required_date'] ? sql2date($line['required_date']) : $cart->due_date, 0, 0);
+		// Constructors use legacy nonlocking readers. The locked source owns the
+		// material intent, including the native noneditable supplier description.
+		$item = $cart->line_items[count($cart->line_items)-1];
+		$item->descr_editable = $line['item_editable'];
+		$item->units = $line['item_units'];
+		$item->tax_type = $line['item_tax_type'];
+		$item->tax_type_name = $line['item_tax_name'];
+		if (!$item->descr_editable && $line['supplier_description'] !== null && $line['supplier_description'] !== '')
+			$item->item_description = $line['supplier_description'];
+	}
+	if (!$cart->order_has_items())
+		throw new RuntimeException('Material request has no outstanding lines.');
+	return array('cart'=>$cart, 'header'=>$mr, 'lines'=>$source_lines, 'material_custody'=>$custody,
+		'header_query'=>$source_query, 'line_query'=>$line_query);
+}
+
+/** Post and link the locked source atomically; callers own direct-policy or actual approved-draft admission. */
+function write_material_request_purchase_order($snapshot, $approval_draft_id = 0) {
+	if (empty($GLOBALS['transaction_level']))
+		throw new RuntimeException('Material purchase linkage requires an owning transaction.');
+	$cart = $snapshot['cart'];
+	$request_id = (int)$snapshot['header']['request_id'];
+	$context = material_core_context();
+	if (!$context || !isset($snapshot['material_custody'])
+		|| material_approved_custody($request_id) !== $snapshot['material_custody'])
+		throw new RuntimeException('Material request approval history changed.');
+	$intent = json_decode(json_encode($cart), true);
+	if (!is_array($intent) || json_last_error() !== JSON_ERROR_NONE)
+		throw new RuntimeException('Material purchase intent could not be encoded.');
+	$po_no = add_po($cart, $approval_draft_id);
+	if (!$po_no || !$cart->is_current_company()
+		|| !$_SESSION['wa_current_user']->can_access('SA_MATERIALREQUEST')
+		|| !$_SESSION['wa_current_user']->can_access('SA_PURCHASEORDER'))
+		throw new RuntimeException('Material request purchase order failed.');
+	verify_material_request_purchase_order_effect($intent, $cart, $po_no);
+	// Locks exclude other connections; native hooks in this transaction can
+	// still change source intent. Never link an order built from that old intent.
+	if ($snapshot['header'] !== db_fetch_assoc(db_query($snapshot['header_query'], 'could not recheck material request conversion')))
+		throw new RuntimeException('Material request source changed.');
+	$lines = db_query($snapshot['line_query'], 'could not recheck material request conversion lines');
+	$current_lines = array();
+	while ($line = db_fetch_assoc($lines))
+		$current_lines[] = $line;
+	if ($snapshot['lines'] !== $current_lines)
+		throw new RuntimeException('Material request source lines changed.');
+	$clock = material_core_rows('SELECT NOW() AS now_');
+	if (!$clock || !db_query('UPDATE '.TB_PREF."wh_material_requests SET status='ordered', linked_doc_type=".ST_PURCHORDER
+		.', linked_doc_no='.(int)$po_no.", updated_at=NOW() WHERE request_id=".(int)$request_id
+		." AND status='approved' AND (linked_doc_no IS NULL OR linked_doc_no=0)", 'could not link material request purchase order')
+		|| db_num_affected_rows() !== 1)
+		throw new RuntimeException('Material request linkage changed.');
+	// Verify the whole terminal source after linking, including trigger/hook effects.
+	$headers = material_core_rows($snapshot['header_query']);
+	$finished = material_core_rows('SELECT NOW() AS now_');
+	$expected = $snapshot['header'];
+	if (!$headers || count($headers) !== 1 || !$finished || !$headers[0]['updated_at']
+		|| $headers[0]['updated_at'] < $clock[0]['now_'] || $headers[0]['updated_at'] > $finished[0]['now_'])
+		throw new RuntimeException('Material request completion is unavailable.');
+	$expected['status'] = 'ordered';
+	$expected['linked_doc_type'] = $headers[0]['linked_doc_type'];
+	$expected['linked_doc_no'] = $headers[0]['linked_doc_no'];
+	$expected['updated_at'] = $headers[0]['updated_at'];
+	if ((int)$expected['linked_doc_type'] !== ST_PURCHORDER || (int)$expected['linked_doc_no'] !== (int)$po_no
+		|| !material_purchase_source_matches($snapshot, $expected)
+		|| material_core_context() !== $context)
+		throw new RuntimeException('Material request completion changed approved source or history.');
+	if ($approval_draft_id) {
+		$state = material_po_completion('peek');
+		if (!$state || $state['draft_id'] !== (int)$approval_draft_id || $state['context'] !== $context)
+			throw new RuntimeException('Material purchase core completion custody is unavailable.');
+		$state['terminal'] = $headers[0]; $state['intent'] = $intent;
+		$state['snapshot'] = $snapshot;
+		material_po_completion('set', $state);
+	}
+	return (int)$po_no;
+}
+
+/**
  * Convert an approved material request to a Purchase Order.
  * Creates a new PO header and lines from the MR lines.
  *
  * @param int    $request_id  Material request ID
  * @param int    $supplier_id Supplier to order from
- * @param string $delivery_to Location code for delivery
+ * @param string $delivery_to Legacy location argument; current source location remains authoritative
  * @return int|false PO transaction number or false on failure
  */
 function convert_material_request_to_po($request_id, $supplier_id, $delivery_to) {
 	global $path_to_root;
-
-	$mr = get_material_request($request_id);
-	if (!$mr || $mr['status'] !== 'approved')
+	if (!isset($_SESSION['wa_current_user'])
+		|| !$_SESSION['wa_current_user']->can_access('SA_MATERIALREQUEST')
+		|| !$_SESSION['wa_current_user']->can_access('SA_PURCHASEORDER')
+		|| !is_scalar($request_id) || (string)(int)$request_id !== (string)$request_id || (int)$request_id <= 0
+		|| !is_scalar($supplier_id) || (string)(int)$supplier_id !== (string)$supplier_id || (int)$supplier_id <= 0)
 		return false;
 
 	include_once($path_to_root . '/purchasing/includes/db/po_db.inc');
-	include_once($path_to_root . '/includes/ui/items_cart.inc');
-
-	// Build a purchase order cart
-	$cart = new items_cart(ST_PURCHORDER);
-	$cart->supplier_id = $supplier_id;
-	$cart->delivery_address = $delivery_to;
-	$cart->Comments = sprintf(_('Created from Material Request %s'), format_material_request_no($mr['request_no']));
-	$cart->Location = $mr['warehouse_loc_code'];
-	$cart->tran_date = Today();
-	$cart->due_date = $mr['required_date'] ? sql2date($mr['required_date']) : Today();
-
-	$lines = get_material_request_lines($request_id);
-	while ($line = db_fetch($lines)) {
-		$outstanding = $line['qty_requested'] - $line['qty_fulfilled'];
-		if ($outstanding <= 0)
-			continue;
-
-		$cart->add_to_cart(
-			count($cart->line_items),
-			$line['stock_id'],
-			$outstanding,
-			0, // unit_price — user should set this in the PO UI
-			'',
-			0, 0,
-			$line['item_description'],
-			$line['item_units']
-		);
-	}
-
-	if (count($cart->line_items) == 0)
+	include_once($path_to_root . '/purchasing/includes/po_class.inc');
+	$cart = new purch_order();
+	if (!$cart->is_current_company() || !begin_transaction())
 		return false;
-
-	$po_no = add_po($cart);
-
-	if ($po_no) {
-		mark_material_request_ordered($request_id, ST_PURCHORDER, $po_no);
+	try {
+		include_once(__DIR__.'/warehouse_material_po_approval_db.inc');
+		$snapshot = prepare_material_request_purchase_order($request_id, $supplier_id);
+		$cart = $snapshot['cart'];
+		if (material_request_purchase_order_has_pending($request_id))
+			throw new RuntimeException('Material request purchase approval is pending.');
+		// This legacy converter has no delayed-execution source envelope. Never
+		// bypass a configured PO workflow by calling its native writer directly.
+		if (!purchase_order_conversion_direct_authorized($cart))
+			throw new RuntimeException('Material request requires purchase order approval.');
+		if (!$cart->is_current_company() || !$_SESSION['wa_current_user']->can_access('SA_MATERIALREQUEST'))
+			throw new RuntimeException('Material request authority changed.');
+		$po_no = write_material_request_purchase_order($snapshot);
+		if (!purchase_order_conversion_direct_authorized($cart))
+			throw new RuntimeException('Material request purchase policy changed.');
+		if (!commit_transaction()) {
+			if (!empty($GLOBALS['transaction_level']))
+				throw new RuntimeException('Material request conversion commit failed.');
+			display_error(_('The purchase order conversion was committed, but resource cleanup needs recovery. Reload the source before continuing.'));
+		}
+		return (int)$po_no;
+	} catch (Exception $exception) {
+		cancel_transaction();
+		return false;
+	} catch (Throwable $exception) {
+		cancel_transaction();
+		throw $exception;
 	}
-
-	return $po_no;
 }
 
 /**
@@ -760,49 +748,55 @@ function convert_material_request_to_po($request_id, $supplier_id, $delivery_to)
  * @return int|false Transfer Order ID or false on failure
  */
 function convert_material_request_to_transfer($request_id, $from_loc_code) {
-	global $path_to_root;
-
-	$mr = get_material_request($request_id);
-	if (!$mr || $mr['status'] !== 'approved')
-		return false;
-
-	include_once($path_to_root . '/inventory/warehouse/includes/db/warehouse_transfers_db.inc');
-
-	$request_date = $mr['request_date'];
-	$expected_recv = $mr['required_date'];
-	$reference = sprintf(_('From MR %s'), format_material_request_no($mr['request_no']));
-
-	begin_transaction();
-
-	$to_id = add_transfer_order(
-		$from_loc_code,
-		$mr['warehouse_loc_code'],
-		$request_date,
-		'standard',
-		$reference,
-		$mr['memo'],
-		null,
-		$expected_recv
-	);
-
-	$lines = get_material_request_lines($request_id);
-	while ($line = db_fetch($lines)) {
-		$outstanding = $line['qty_requested'] - $line['qty_fulfilled'];
-		if ($outstanding <= 0)
-			continue;
-
-		add_transfer_order_line(
-			$to_id,
-			$line['stock_id'],
-			$outstanding
-		);
-	}
-
-	mark_material_request_ordered($request_id, ST_LOCTRANSFER, $to_id);
-
-	commit_transaction();
-
-	return $to_id;
+    global $path_to_root;
+    // Role, company and canonical identity checks precede even a source read.
+    if (!is_scalar($request_id) || (string)(int)$request_id !== (string)$request_id
+        || (int)$request_id <= 0 || !is_string($from_loc_code) || $from_loc_code === ''
+        || strpos($from_loc_code, "\0") !== false) return false;
+    require_once __DIR__.'/warehouse_material_transfer_link_db.inc';
+    require_once $path_to_root.'/inventory/warehouse/includes/db/warehouse_transfers_db.inc';
+    $material_context = material_core_context(); $transfer_context = transfer_core_context();
+    $actor = isset($_SESSION['wa_current_user']->user) ? dimension_writer_reference_id($_SESSION['wa_current_user']->user) : false;
+    if (!$material_context || !$transfer_context || !$actor) return false;
+    try {
+        if (!begin_transaction()) return false;
+        // Approval history and current native source are locked together. A
+        // historical Approved status without its original core receipt denies.
+        $custody = material_approved_custody((int)$request_id);
+        if (!$custody || $custody['source']['header']['request_type'] !== 'transfer'
+            || (int)$custody['source']['header']['requested_by'] !== $actor
+            || $custody['source']['header']['warehouse_loc_code'] === $from_loc_code
+            || !$custody['source']['lines']) { cancel_transaction(); return false; }
+        $source = $custody['source']; $header = $source['header'];
+        $valuation = material_transfer_current_valuation($source);
+        if ($valuation === false) { cancel_transaction(); return false; }
+        $reference = sprintf(_('From MR %s'), format_material_request_no($header['request_no']));
+        $to_id = add_transfer_order($from_loc_code, $header['warehouse_loc_code'],
+            $header['request_date'], 'standard', $reference, $header['memo'], null, $header['required_date']);
+        if (!$to_id) { cancel_transaction(); return false; }
+        foreach ($source['lines'] as $index=>$line) {
+            // No partial, lossy or implicitly rounded conversion quantities.
+            $quantity = transfer_line_decimal($line['qty_requested'], true);
+            if ($quantity === false || !add_transfer_order_line($to_id, $line['stock_id'], $quantity,
+                null, null, null, null, $valuation[$index]['unit_cost'])) {
+                cancel_transaction(); return false;
+            }
+        }
+        $native = transfer_line_source((int)$to_id);
+        if (!$native || !material_transfer_pair_matches($source, $native, $actor, $from_loc_code, null, $valuation)
+            || material_approved_custody((int)$request_id) !== $custody
+            || material_core_context() !== $material_context || transfer_core_context() !== $transfer_context) {
+            cancel_transaction(); return false;
+        }
+        // The single native command owns the source linkage and checks all raw
+        // review, child, number, company and transfer bytes before commit.
+        $snapshot = array('custody'=>$custody, 'transfer'=>$native, 'from'=>$from_loc_code, 'valuation'=>$valuation);
+        if (!mark_material_request_ordered($request_id, ST_LOCTRANSFER, $to_id, $snapshot)
+            || material_core_context() !== $material_context || transfer_core_context() !== $transfer_context
+            || !commit_transaction()) { cancel_transaction(); return false; }
+        return (int)$to_id;
+    } catch (Exception $exception) { cancel_transaction(); return false;
+    } catch (Throwable $exception) { cancel_transaction(); return false; }
 }
 
 /**

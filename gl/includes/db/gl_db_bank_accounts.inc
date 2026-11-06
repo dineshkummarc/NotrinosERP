@@ -10,45 +10,60 @@
 	See the License here <http://www.gnu.org/licenses/gpl-3.0.html>.
 ***********************************************************************/
 
+require_once __DIR__.'/../../../dimensions/includes/dimension_financial_reference_writer.inc';
+
 function clear_dflt_curr_account($curr_code) {
 	$sql = "UPDATE ".TB_PREF."bank_accounts SET dflt_curr_act = 0 WHERE bank_curr_code = ".db_escape($curr_code);
-	db_query($sql, 'could not update default currency account');
+	return db_query($sql);
 }
 
+/** Create a bank account and its currency default in one reference boundary. */
 function add_bank_account($account_code, $account_type, $bank_account_name, $bank_name, $bank_account_number, $bank_address, $bank_curr_code, $dflt_curr_act, $bank_charge_act) {
-	if($dflt_curr_act) 	// only one default account for any currency
-	  clear_dflt_curr_account($bank_curr_code);
+	require_once __DIR__.'/../../../dimensions/includes/dimension_reference_writer_fence.inc';
+	return dimension_ordinary_master_write('bank_accounts', null, array(),
+		function() use ($account_code, $account_type, $bank_account_name, $bank_name, $bank_account_number, $bank_address, $bank_curr_code, $dflt_curr_act, $bank_charge_act) {
+			if ($dflt_curr_act && !clear_dflt_curr_account($bank_curr_code)) return false;
 
-	$sql = "INSERT INTO ".TB_PREF."bank_accounts (account_code, account_type, 
-		bank_account_name, bank_name, bank_account_number, bank_address, 
-		bank_curr_code, dflt_curr_act, bank_charge_act)
-		VALUES (".db_escape($account_code).", ".db_escape($account_type).", "
-		.db_escape($bank_account_name).", ".db_escape($bank_name).", "
-		.db_escape($bank_account_number).",".db_escape($bank_address).
-		", ".db_escape($bank_curr_code).", ".db_escape($dflt_curr_act).", ".db_escape($bank_charge_act).")";
+			$sql = "INSERT INTO ".TB_PREF."bank_accounts (account_code, account_type,
+				bank_account_name, bank_name, bank_account_number, bank_address,
+				bank_curr_code, dflt_curr_act, bank_charge_act)
+				VALUES (".db_escape($account_code).", ".db_escape($account_type).", "
+				.db_escape($bank_account_name).", ".db_escape($bank_name).", "
+				.db_escape($bank_account_number).",".db_escape($bank_address).
+				", ".db_escape($bank_curr_code).", ".db_escape($dflt_curr_act).", ".db_escape($bank_charge_act).")";
 
-	db_query($sql, "could not add a bank account for $account_code");
+			return db_query($sql);
+		});
 }
 
+/** Maintain the current bank owner while retaining its serialized references. */
 function update_bank_account($id, $account_code, $account_type, $bank_account_name, $bank_name, $bank_account_number, $bank_address, $bank_curr_code, $dflt_curr_act, $bank_charge_act) {
-	if($dflt_curr_act) 	// only one default account for any currency
-	  clear_dflt_curr_account($bank_curr_code);
+	require_once __DIR__.'/../../../dimensions/includes/dimension_reference_writer_fence.inc';
+	return dimension_ordinary_master_write('bank_accounts', $id, array(),
+		function() use ($id, $account_code, $account_type, $bank_account_name, $bank_name, $bank_account_number, $bank_address, $bank_curr_code, $dflt_curr_act, $bank_charge_act) {
+			if ($dflt_curr_act && !clear_dflt_curr_account($bank_curr_code)) return false;
 
-	$sql = "UPDATE ".TB_PREF."bank_accounts	SET account_type = ".db_escape($account_type).",
-		account_code=".db_escape($account_code).",
-		bank_account_name=".db_escape($bank_account_name).", bank_name=".db_escape($bank_name).",
-		bank_account_number=".db_escape($bank_account_number).", bank_curr_code=".db_escape($bank_curr_code).",
-		bank_address=".db_escape($bank_address).",
-		dflt_curr_act=".db_escape($dflt_curr_act).", bank_charge_act=".db_escape($bank_charge_act)." 
-		WHERE id = ".db_escape($id);
+			$sql = "UPDATE ".TB_PREF."bank_accounts	SET account_type = ".db_escape($account_type).",
+				account_code=".db_escape($account_code).",
+				bank_account_name=".db_escape($bank_account_name).", bank_name=".db_escape($bank_name).",
+				bank_account_number=".db_escape($bank_account_number).", bank_curr_code=".db_escape($bank_curr_code).",
+				bank_address=".db_escape($bank_address).",
+				dflt_curr_act=".db_escape($dflt_curr_act).", bank_charge_act=".db_escape($bank_charge_act)."
+				WHERE id = ".db_escape($id);
 
-	db_query($sql, "could not update bank account for $account_code");
+			return db_query($sql);
+		});
 }
 
+/** Deny removal of retained bank references under current owner/master locks. */
 function delete_bank_account($id) {
-	$sql = "DELETE FROM ".TB_PREF."bank_accounts WHERE id=".db_escape($id);
+	require_once __DIR__.'/../../../dimensions/includes/dimension_reference_writer_fence.inc';
+	return dimension_ordinary_master_write('bank_accounts', $id, array(),
+		function() use ($id) {
+			$sql = "DELETE FROM ".TB_PREF."bank_accounts WHERE id=".db_escape($id);
 
-	db_query($sql, "could not delete bank account for $id");
+			return db_query($sql);
+		}, false, true);
 }
 
 function get_bank_account($id) {
@@ -91,7 +106,7 @@ function get_bank_charge_account($id) {
 }
 
 function add_quick_entry($description, $type, $base_amount, $base_desc, $bal_type, $usage) {
-	$sql = "INSERT INTO ".TB_PREF."quick_entries (description, type, base_amount, base_desc, bal_type, `usage`) 
+	$sql = "INSERT INTO ".TB_PREF."quick_entries (description, type, base_amount, base_desc, bal_type, `usage`)
 	VALUES (".db_escape($description).", ".db_escape($type).", "
 		.db_escape($base_amount).", ".db_escape($base_desc).", ".db_escape($bal_type).", ".db_escape($usage).")";
 
@@ -113,23 +128,40 @@ function delete_quick_entry($selected_id) {
 	db_query($sql, "could not delete quick entry $selected_id");
 }
 
+/** Create a template line while its native Dimension defaults are locked. */
 function add_quick_entry_line($qid, $action, $dest_id, $amount, $dim, $dim2, $memo) {
-	$sql = "INSERT INTO ".TB_PREF."quick_entry_lines (qid, action, dest_id, amount, dimension_id, dimension2_id, memo) 
-	VALUES (".db_escape($qid).", ".db_escape($action).",".db_escape($dest_id).",".db_escape($amount).", ".db_escape($dim).", ".db_escape($dim2).", ".db_escape($memo).")";
+	require_once __DIR__.'/../../../dimensions/includes/dimension_reference_writer_fence.inc';
+	return dimension_ordinary_master_write('quick_entry_lines', null,
+		array('dimension_id'=>$dim, 'dimension2_id'=>$dim2), function($next) use ($qid, $action, $dest_id, $amount, $memo) {
+			$dim = $next['dimension_id']; $dim2 = $next['dimension2_id'];
+			$sql = "INSERT INTO ".TB_PREF."quick_entry_lines (qid, action, dest_id, amount, dimension_id, dimension2_id, memo)
+			VALUES (".db_escape($qid).", ".db_escape($action).",".db_escape($dest_id).",".db_escape($amount).", ".db_escape($dim).", ".db_escape($dim2).", ".db_escape($memo).")";
 
-	db_query($sql, "could not insert quick entry line for $qid");
+			return db_query($sql);
+	});
 }
 
+/** Serialize template changes against current owner and former/new defaults. */
 function update_quick_entry_line($selected_id, $qid, $action, $dest_id, $amount, $dim, $dim2, $memo) {
-	$sql = "UPDATE ".TB_PREF."quick_entry_lines SET qid = ".db_escape($qid).", action=".db_escape($action).", dest_id=".db_escape($dest_id).", amount=".db_escape($amount).", dimension_id=".db_escape($dim).", dimension2_id=".db_escape($dim2).", memo=".db_escape($memo)." WHERE id = ".db_escape($selected_id);
+	require_once __DIR__.'/../../../dimensions/includes/dimension_reference_writer_fence.inc';
+	return dimension_ordinary_master_write('quick_entry_lines', $selected_id,
+		array('dimension_id'=>$dim, 'dimension2_id'=>$dim2), function($next) use ($selected_id, $qid, $action, $dest_id, $amount, $memo) {
+			$dim = $next['dimension_id']; $dim2 = $next['dimension2_id'];
+			$sql = "UPDATE ".TB_PREF."quick_entry_lines SET qid = ".db_escape($qid).", action=".db_escape($action).", dest_id=".db_escape($dest_id).", amount=".db_escape($amount).", dimension_id=".db_escape($dim).", dimension2_id=".db_escape($dim2).", memo=".db_escape($memo)." WHERE id = ".db_escape($selected_id);
 
-	db_query($sql, "could not update quick entry line for $selected_id");
+			return db_query($sql);
+	});
 }
 
+/** Lock the line and its former defaults before removing an unused template line. */
 function delete_quick_entry_line($selected_id) {
-	$sql = "DELETE FROM ".TB_PREF."quick_entry_lines WHERE id=".db_escape($selected_id);
+	require_once __DIR__.'/../../../dimensions/includes/dimension_reference_writer_fence.inc';
+	return dimension_ordinary_master_write('quick_entry_lines', $selected_id,
+		array('dimension_id'=>0, 'dimension2_id'=>0), function() use ($selected_id) {
+			$sql = "DELETE FROM ".TB_PREF."quick_entry_lines WHERE id=".db_escape($selected_id);
 
-	db_query($sql,"could not delete quick entry line $selected_id");
+			return db_query($sql);
+	}, false, true);
 }
 
 function has_quick_entries($type=null) {
@@ -216,16 +248,17 @@ function get_sql_for_bank_account_reconcile($bank_account, $date) {
 }
 
 function update_reconciled_values($reconcile_id, $reconcile_value, $reconcile_date, $end_balance, $bank_account) {
-	$sql = "UPDATE ".TB_PREF."bank_trans SET reconciled=$reconcile_value WHERE id=".db_escape($reconcile_id);
-
-	db_query($sql, "Can't change reconciliation status");
-	// save last reconcilation status (date, end balance)
-	$sql2 = "UPDATE ".TB_PREF."bank_accounts SET last_reconciled_date='"
-		.date2sql($reconcile_date)."',
-		ending_reconcile_balance=$end_balance
-		WHERE id=".db_escape($bank_account);
-
-	db_query($sql2, 'Error updating reconciliation information');
+    if(!begin_transaction())dimension_financial_reference_failure();
+    $result=dimension_ordinary_master_write('bank_accounts',$bank_account,array(),function($admitted)use($reconcile_id,$reconcile_value,$reconcile_date,$end_balance,$bank_account){
+        dimension_financial_reference_write('bank_trans',$reconcile_id,array(),function($admitted)use($reconcile_id,$reconcile_value,$bank_account){
+            $row=dimension_financial_reference_row('bank_trans',$reconcile_id);
+            if(!$row || (int)$row['bank_act']!==(int)$bank_account)return false;
+            return db_query('UPDATE '.TB_PREF.'bank_trans SET reconciled='.$reconcile_value.' WHERE id='.(int)$reconcile_id)!==false;
+        });
+        return db_query('UPDATE '.TB_PREF.'bank_accounts SET last_reconciled_date=\''.date2sql($reconcile_date).'\',ending_reconcile_balance='.db_escape($end_balance).' WHERE id='.(int)$bank_account)!==false;
+    },true);
+    if(!$result || !commit_transaction())dimension_financial_reference_failure();
+    return true;
 }
 
 //
@@ -236,7 +269,7 @@ function update_reconciled_values($reconcile_id, $reconcile_value, $reconcile_da
 //	first defined account in home currency
 //
 function get_default_bank_account($curr=null) {
-	
+
 	$home_curr = get_company_pref('curr_default');
 	if (!isset($curr))
 		$curr = $home_curr;
@@ -273,7 +306,7 @@ function get_bank_account_limit($account, $date, $user=null) {
 		return null;
 	return max(0, get_balance_before_for_bank_account($account, add_days($date, 1))); // in case of manco made before the check was implemented
 }
- 
+
 function identify_bank_account($account_number) {
 
 	$sql = "(SELECT id AS id, ".BO_COMPANY." AS type FROM ".TB_PREF."bank_accounts WHERE REPLACE(bank_account_number,' ', '')=".db_escape($account_number).")

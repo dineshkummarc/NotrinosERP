@@ -71,6 +71,11 @@ class ApprovalWorkflow {
 	 *   'draft_renderer' => callable Function to render draft for review UI
 	 *   'edit_url'       => string   URL for editing the draft
 	 *   'number_context' => array    Context for reference number generation (optional)
+	 *   'action_validator' => callable Optional source validation before actions/automatic approval
+	 *   'action_locker' => callable Optional family locks before the selected draft lock; grants no authority
+	 *   'action_completion_validator' => callable Optional final approve/reject/cancel verification
+	 *   'submitted'      => callable Optional atomic business custody after draft submission
+	 *   'independent_approval' => bool Require a checker; disallow direct/self/automatic approval
 	 * @return void
 	 */
 	public static function registerTransactionType($trans_type, $config)
@@ -85,6 +90,11 @@ class ApprovalWorkflow {
 			'draft_renderer' => null,
 			'edit_url'       => '',
 			'number_context' => array(),
+			'action_validator' => null,
+			'action_locker' => null,
+			'action_completion_validator' => null,
+			'independent_approval' => false,
+			'submitted'      => null,
 		);
 
 		self::$registered_types[$trans_type] = array_merge($defaults, $config);
@@ -140,6 +150,67 @@ class ApprovalWorkflow {
 		$this->user_id = $user_id !== null ? (int)$user_id : (int)$_SESSION['wa_current_user']->user;
 	}
 
+	/**
+	 * Observe retained ordinary GL/Purchasing/Sales/Inventory/WO/WMS intent without exposing payloads.
+	 * Uses the workflow's own historical decoder and fixed source-owned shapes.
+	 * Every unsupported domain remains unknown and its
+	 * payload is excluded by SQL CASE before it reaches PHP. All statuses, actors
+	 * and action snapshots are retained in scope. This is never delete authority
+	 * or a concurrent owner-writer fence (DIM-LFC-001B3a).
+	 *
+	 * @param int|string $id Exact positive Dimension identity in the active company
+	 * @return array Owner names and used/unused/unknown states only
+	 */
+	public function observeDimensionReferences($id)
+	{
+		require_once dirname(dirname(__DIR__)).'/dimensions/includes/dimension_lifecycle_db.inc';
+		require_once dirname(dirname(__DIR__)).'/dimensions/includes/dimension_reference_registry.inc';
+		$result = array('approval_drafts'=>'unknown', 'approval_actions'=>'unknown');
+		if (!dimension_lifecycle_authorized() || !dimension_lifecycle_valid_id($id)
+			|| !defined('ST_JOURNAL') || !defined('ST_BANKPAYMENT') || !defined('ST_BANKDEPOSIT')) return $result;
+		require_once dirname(dirname(__DIR__)).'/purchasing/includes/db/purch_dimension_references_db.inc';
+		$supported_types = array((int)ST_JOURNAL, (int)ST_BANKPAYMENT, (int)ST_BANKDEPOSIT);
+		foreach (array('ST_PURCHORDER','ST_SUPPINVOICE','ST_PURCHREQUISITION','ST_PURCHAGREEMENT',
+			'ST_SALESINVOICE','ST_SALESORDER','ST_CUSTDELIVERY','ST_INVADJUST','ST_LOCTRANSFER','ST_WORKORDER',
+			'ST_WH_MATERIAL_REQUEST','ST_WH_TRANSFER_ORDER','ST_WH_SCRAP','ST_WH_CYCLE_COUNT') as $type)
+			if (defined($type)) $supported_types[] = (int)constant($type);
+		$types = implode(',', $supported_types);
+		$queries = array(
+			'approval_drafts'=>'SELECT CASE WHEN trans_type IN ('.$types.') THEN 1 ELSE 0 END AS supported,'
+				.' CASE WHEN trans_type IN ('.$types.') THEN trans_type ELSE NULL END AS source_type,'
+				.' CASE WHEN trans_type IN ('.$types.') THEN draft_data ELSE NULL END AS payload'
+				.' FROM '.TB_PREF.'approval_drafts',
+			'approval_actions'=>'SELECT CASE WHEN d.trans_type IN ('.$types.') THEN 1 ELSE 0 END AS supported,'
+				.' CASE WHEN d.trans_type IN ('.$types.') THEN d.trans_type ELSE NULL END AS source_type,'
+				.' CASE WHEN d.trans_type IN ('.$types.') THEN a.draft_data_snapshot ELSE NULL END AS payload'
+				.' FROM '.TB_PREF.'approval_actions a LEFT JOIN '.TB_PREF.'approval_drafts d ON d.id=a.draft_id'
+				.' WHERE a.draft_data_snapshot IS NOT NULL');
+		foreach ($queries as $owner=>$sql) {
+			$status = 'unused';
+			try {
+				if (!purchasing_dimension_reference_schema_available($owner)
+					|| ($owner === 'approval_actions' && !purchasing_dimension_reference_schema_available('approval_drafts'))) {
+					$result[$owner] = 'unknown';
+					continue;
+				}
+				$rows = db_query($sql);
+				if (!$rows) $status = 'unknown';
+				else while ($row = db_fetch($rows)) {
+					if ((int)$row['supported'] !== 1) { $status = 'unknown'; continue; }
+					$ok = false;
+					$payload = $this->decodeDraftData($row['payload'], $ok);
+					$observed = $ok ? dimension_reference_payload_status($payload, (int)$id) : 'unknown';
+					if ($ok && defined('ST_SUPPINVOICE') && (int)$row['source_type'] === (int)ST_SUPPINVOICE)
+						$observed = purchasing_invoice_approval_dimension_status($payload, (int)$id);
+					if ($observed === 'used') { $status = 'used'; break; }
+					if ($observed !== 'unused') $status = 'unknown';
+				}
+			} catch (Exception $exception) { $status = 'unknown'; }
+			$result[$owner] = $status;
+		}
+		return $result;
+	}
+
 	// =====================================================
 	// WORKFLOW API — Submit / Approve / Reject
 	// =====================================================
@@ -159,14 +230,20 @@ class ApprovalWorkflow {
 	 *   'summary'     => string Human-readable summary
 	 *   'currency'    => string Currency code
 	 *   'loc_code'    => string Location code
+	 * @param bool $lock_policy Use current policy under an owning source transaction
 	 * @return array ['draft_id' => int, 'trans_no' => int, 'reference' => string,
 	 *   'status' => string] Status is no_workflow, reservation_failed,
 	 *   serialization_failed, storage_failed, audit_failed, no_approvers,
 	 *   notification_failed, execution_failed, auto_approved, or pending.
 	 */
-	public function submit($trans_type, $data, $amount = 0, $context = array())
+	public function submit($trans_type, $data, $amount = 0, $context = array(), $lock_policy = false)
 	{
-		$workflow = $this->getWorkflowForType($trans_type);
+		if ($lock_policy && empty($GLOBALS['transaction_level']))
+			throw new RuntimeException('Current approval submission requires an owning transaction.');
+		$workflow = $lock_policy ? get_approval_workflow_by_type($trans_type, true)
+			: $this->getWorkflowForType($trans_type);
+		if ($lock_policy && $workflow && (!$workflow['is_active'] || !workflow_has_active_levels($workflow['id'], true)))
+			$workflow = false;
 
 		if (!$workflow)
 			return array('draft_id' => 0, 'trans_no' => 0, 'reference' => '', 'status' => 'no_workflow');
@@ -174,6 +251,10 @@ class ApprovalWorkflow {
 		begin_transaction();
 
 		// Reserve transaction number
+		if (!$this->validateRegisteredAction('submit', $trans_type, $data)) {
+			cancel_transaction();
+			return array('draft_id'=>0, 'trans_no'=>0, 'reference'=>'', 'status'=>'validation_failed');
+		}
 		$number_context = isset(self::$registered_types[$trans_type]['number_context'])
 			? self::$registered_types[$trans_type]['number_context']
 			: array();
@@ -242,7 +323,14 @@ class ApprovalWorkflow {
 		}
 
 		// Check auto-approval: if amount is within threshold of level 1
-		$auto_approved = $this->checkAutoApproval($draft_id, $workflow, $amount, $data, $context);
+		$config = self::getTypeConfig($trans_type);
+		if ($config && !empty($config['submitted'])
+			&& (!is_callable($config['submitted'])
+				|| call_user_func($config['submitted'], $data, $draft_id) === false)) {
+			cancel_transaction();
+			return array('draft_id'=>0, 'trans_no'=>0, 'reference'=>'', 'status'=>'business_custody_failed');
+		}
+		$auto_approved = $this->checkAutoApproval($draft_id, $workflow, $amount, $data, $context, $lock_policy);
 
 		if ($auto_approved) {
 			// Execute immediately
@@ -278,7 +366,8 @@ class ApprovalWorkflow {
 			$workflow['id'],
 			1,
 			'pending',
-			isset($context['loc_code']) ? $context['loc_code'] : null
+			isset($context['loc_code']) ? $context['loc_code'] : null,
+			$lock_policy
 		);
 		if (!is_array($notification_result)
 			|| !isset($notification_result['status'], $notification_result['count'])
@@ -323,8 +412,12 @@ class ApprovalWorkflow {
 	 */
 	public function approve($draft_id, $comments = '', $edited = false)
 	{
+		// Probe before opening a transaction: type discovery must not start an
+		// earlier repeatable-read snapshot while waiting for the selected draft.
+		$probe = get_approval_draft($draft_id);
 		begin_transaction();
-		$draft = get_approval_draft_for_update($draft_id);
+		$draft = $this->lockRegisteredActionFamily($probe) ? get_approval_draft_for_update($draft_id) : false;
+		if ($draft && (int)$draft['trans_type'] !== (int)$probe['trans_type']) $draft = false;
 
 		if (!$draft) {
 			cancel_transaction();
@@ -337,13 +430,20 @@ class ApprovalWorkflow {
 		}
 
 		// Verify user can approve at this level
+		if (!$this->validateRegisteredAction('approve', $draft['trans_type'], null, $draft, $comments)) {
+			cancel_transaction();
+			return array('status'=>'error', 'trans_no'=>null, 'message'=>_('The business approval source could not be verified.'));
+		}
 		if (!$this->canActOnDraft($draft_id)) {
 			cancel_transaction();
 			return array('status' => 'error', 'trans_no' => null, 'message' => _('You do not have permission to approve this draft.'));
 		}
 
-		// Check self-approval restriction
-		if (!$draft['allow_self_approve'] && (int)$draft['submitted_by'] === $this->user_id) {
+		// Registration may require an independent checker even if legacy setup
+		// permits self approval. Keep the policy default for other families.
+		$config = self::getTypeConfig($draft['trans_type']);
+		if ((!$draft['allow_self_approve'] || ($config && !empty($config['independent_approval'])))
+			&& (int)$draft['submitted_by'] === $this->user_id) {
 			cancel_transaction();
 			return array('status' => 'error', 'trans_no' => null, 'message' => _('You cannot approve your own submission.'));
 		}
@@ -396,16 +496,22 @@ class ApprovalWorkflow {
 				}
 
 				// Notify submitter
+				$posted_draft = get_approval_draft($draft_id);
 				notify_approval_submitter($draft_id, $draft['submitted_by'], 'approved');
 
 				// Mark all notifications as read
 				mark_all_draft_notifications_read($draft_id);
 
+				if (!$this->validateRegisteredCompletion('approved', $draft, $comments)) {
+					cancel_transaction();
+					return array('status'=>'error', 'trans_no'=>null, 'message'=>_('The completed business action could not be verified. No changes were committed.'));
+				}
+
 				commit_transaction();
 
 				return array(
 					'status'   => 'approved',
-					'trans_no' => (int)$draft['reserved_trans_no'],
+					'trans_no' => (int)$posted_draft['approved_trans_no'],
 					'message'  => _('Draft has been approved and posted.'),
 				);
 			} else {
@@ -442,13 +548,19 @@ class ApprovalWorkflow {
 						);
 					}
 					notify_approval_submitter($draft_id, $draft['submitted_by'], 'approved');
+					$posted_draft = get_approval_draft($draft_id);
 					mark_all_draft_notifications_read($draft_id);
+
+					if (!$this->validateRegisteredCompletion('approved', $draft, $comments)) {
+						cancel_transaction();
+						return array('status'=>'error', 'trans_no'=>null, 'message'=>_('The completed business action could not be verified. No changes were committed.'));
+					}
 
 					commit_transaction();
 
 					return array(
 						'status'   => 'approved',
-						'trans_no' => (int)$draft['reserved_trans_no'],
+						'trans_no' => (int)$posted_draft['approved_trans_no'],
 						'message'  => _('Draft has been approved and posted (auto-approved at next level).'),
 					);
 				}
@@ -462,6 +574,11 @@ class ApprovalWorkflow {
 					$draft['loc_code']
 				);
 
+				if (!$this->validateRegisteredCompletion('pending_next_level', $draft, $comments)) {
+					cancel_transaction();
+					return array('status'=>'error', 'trans_no'=>null, 'message'=>_('The completed business action could not be verified. No changes were committed.'));
+				}
+
 				commit_transaction();
 
 				return array(
@@ -473,6 +590,11 @@ class ApprovalWorkflow {
 		}
 
 		// Not enough approvals at this level yet (parallel approval scenario)
+		if (!$this->validateRegisteredCompletion('pending_more_approvers', $draft, $comments)) {
+			cancel_transaction();
+			return array('status'=>'error', 'trans_no'=>null, 'message'=>_('The completed business action could not be verified. No changes were committed.'));
+		}
+
 		commit_transaction();
 
 		return array(
@@ -498,8 +620,12 @@ class ApprovalWorkflow {
 	 */
 	public function reject($draft_id, $comments)
 	{
+		// Probe before opening a transaction: type discovery must not start an
+		// earlier repeatable-read snapshot while waiting for the selected draft.
+		$probe = get_approval_draft($draft_id);
 		begin_transaction();
-		$draft = get_approval_draft_for_update($draft_id);
+		$draft = $this->lockRegisteredActionFamily($probe) ? get_approval_draft_for_update($draft_id) : false;
+		if ($draft && (int)$draft['trans_type'] !== (int)$probe['trans_type']) $draft = false;
 
 		if (!$draft) {
 			cancel_transaction();
@@ -517,6 +643,11 @@ class ApprovalWorkflow {
 		}
 
 		// Require comments if configured
+		if (!$this->validateRegisteredAction('reject', $draft['trans_type'], null, $draft, $comments)) {
+			cancel_transaction();
+			return array('status'=>'error', 'message'=>_('The business rejection source could not be verified.'));
+		}
+
 		if ($draft['require_comments_on_reject'] && empty(trim($comments))) {
 			cancel_transaction();
 			return array('status' => 'error', 'message' => _('Comments are required for rejection.'));
@@ -561,6 +692,11 @@ class ApprovalWorkflow {
 		// Mark all notifications read
 		mark_all_draft_notifications_read($draft_id);
 
+		if (!$this->validateRegisteredCompletion('rejected', $draft, $comments)) {
+			cancel_transaction();
+			return array('status'=>'error', 'trans_no'=>null, 'message'=>_('The completed business action could not be verified. No changes were committed.'));
+		}
+
 		commit_transaction();
 
 		return array('status' => 'rejected', 'message' => _('Draft has been rejected.'));
@@ -575,8 +711,12 @@ class ApprovalWorkflow {
 	 */
 	public function cancel($draft_id, $comments = '')
 	{
+		// Probe before opening a transaction: type discovery must not start an
+		// earlier repeatable-read snapshot while waiting for the selected draft.
+		$probe = get_approval_draft($draft_id);
 		begin_transaction();
-		$draft = get_approval_draft_for_update($draft_id);
+		$draft = $this->lockRegisteredActionFamily($probe) ? get_approval_draft_for_update($draft_id) : false;
+		if ($draft && (int)$draft['trans_type'] !== (int)$probe['trans_type']) $draft = false;
 
 		if (!$draft) {
 			cancel_transaction();
@@ -594,6 +734,11 @@ class ApprovalWorkflow {
 			return array('status' => 'error', 'message' => _('Only the submitter can cancel this draft.'));
 		}
 
+		// Native and other opted-in types must validate before any business action survives.
+		if (!$this->validateRegisteredAction('cancel', $draft['trans_type'], null, $draft, $comments)) {
+			cancel_transaction();
+			return array('status'=>'error', 'message'=>_('The business cancellation source could not be verified.'));
+		}
 		add_approval_action($draft_id, 'cancel', $this->user_id, (int)$draft['current_level'], $comments);
 		if (!update_approval_draft_status(
 			$draft_id,
@@ -622,6 +767,11 @@ class ApprovalWorkflow {
 		void_reserved_trans_number($draft['trans_type'], $draft['reserved_trans_no'], 'Cancelled');
 		mark_all_draft_notifications_read($draft_id);
 
+		if (!$this->validateRegisteredCompletion('cancelled', $draft, $comments)) {
+			cancel_transaction();
+			return array('status'=>'error', 'trans_no'=>null, 'message'=>_('The completed business action could not be verified. No changes were committed.'));
+		}
+
 		commit_transaction();
 
 		return array('status' => 'cancelled', 'message' => _('Draft has been cancelled.'));
@@ -644,6 +794,8 @@ class ApprovalWorkflow {
 
 		if ((int)$draft['status'] !== APPROVAL_STATUS_PENDING)
 			return array('status' => 'error', 'message' => _('Draft is not pending approval.'));
+		if (!$this->validateRegisteredAction('delegate', $draft['trans_type'], null, $draft, $reason))
+			return array('status'=>'error', 'message'=>_('The business delegation source could not be verified.'));
 
 		if (!$this->canActOnDraft($draft_id))
 			return array('status' => 'error', 'message' => _('You do not have permission to delegate this draft.'));
@@ -679,20 +831,30 @@ class ApprovalWorkflow {
 	 *
 	 * @param int   $trans_type Transaction type constant
 	 * @param float $amount     Transaction amount
+	 * @param bool  $lock_policy Current locking reads for an owning direct conversion
 	 * @return bool             True if approval is required
 	 */
-	public function isApprovalRequired($trans_type, $amount = 0)
+	public function isApprovalRequired($trans_type, $amount = 0, $lock_policy = false)
 	{
+		if ($lock_policy && empty($GLOBALS['transaction_level']))
+			throw new RuntimeException('A locked approval policy requires an owning transaction.');
+		// A registered independent-checker contract is a requirement even when
+		// setup is unavailable. submit() owns the fail-closed policy validation.
+		$config = self::getTypeConfig($trans_type);
+		if ($config && !empty($config['independent_approval']))
+			return true;
 		// Check if user has direct post bypass
 		if ($this->canDirectPost($trans_type))
 			return false;
 
-		$workflow = $this->getWorkflowForType($trans_type);
+		$workflow = $lock_policy ? get_approval_workflow_by_type($trans_type, true)
+			: $this->getWorkflowForType($trans_type);
 
 		if (!$workflow || !$workflow['is_active'])
 			return false;
 
-		if (!workflow_has_active_levels($workflow['id']))
+		if (!($lock_policy ? workflow_has_active_levels($workflow['id'], true)
+			: workflow_has_active_levels($workflow['id'])))
 			return false;
 
 		return true;
@@ -706,6 +868,9 @@ class ApprovalWorkflow {
 	 */
 	public function canDirectPost($trans_type)
 	{
+		$config = self::getTypeConfig($trans_type);
+		if ($config && !empty($config['independent_approval']))
+			return false;
 		return check_security_area('SA_APPROVALDIRECT');
 	}
 
@@ -736,11 +901,14 @@ class ApprovalWorkflow {
 	 * Check if current user can approve/reject a specific draft.
 	 *
 	 * @param int $draft_id Draft ID
+	 * @param bool $lock_policy Read current checker roles/delegations inside an owning transaction
 	 * @return bool
 	 */
-	public function canActOnDraft($draft_id)
+	public function canActOnDraft($draft_id, $lock_policy = false)
 	{
-		$draft = get_approval_draft($draft_id);
+		if ($lock_policy && empty($GLOBALS['transaction_level']))
+			throw new RuntimeException('Current checker policy requires an owning transaction.');
+		$draft = $lock_policy ? get_approval_draft_for_update($draft_id) : get_approval_draft($draft_id);
 
 		if (!$draft || (int)$draft['status'] !== APPROVAL_STATUS_PENDING)
 			return false;
@@ -751,16 +919,16 @@ class ApprovalWorkflow {
 		$approver_roles = get_approver_roles_at_level(
 			$draft['workflow_id'],
 			$current_level,
-			$draft['loc_code']
+			$draft['loc_code'], $lock_policy
 		);
 
 		if (in_array($this->role_id, $approver_roles))
 			return true;
 
 		// Check delegations
-		$delegations = get_active_delegations_to_user($this->user_id, $draft['trans_type']);
+		$delegations = get_active_delegations_to_user($this->user_id, $draft['trans_type'], $lock_policy);
 		while ($delegation = db_fetch($delegations)) {
-			$delegator_role = $this->getDelegatorRole($delegation['from_user_id']);
+			$delegator_role = $this->getDelegatorRole($delegation['from_user_id'], $lock_policy);
 			if (in_array($delegator_role, $approver_roles))
 				return true;
 		}
@@ -823,8 +991,14 @@ class ApprovalWorkflow {
 		return $workflow;
 	}
 
+	/** Reuse canonical stored-byte decoding for an already source-authorized owner, without reads or mutations. */
+	public function decodeStoredDraftData($draft_data, &$decode_ok = null)
+	{
+		return $this->decodeDraftData($draft_data, $decode_ok);
+	}
+
 	/**
-	 * Decode one current or historical approval draft JSON payload.
+	 * Decode one current or historical approval draft JSON payload without reading source data.
 	 *
 	 * Approval draft text is stored through the legacy db_escape() boundary,
 	 * which HTML-encodes quote and ampersand characters. Older deployments may
@@ -889,11 +1063,17 @@ class ApprovalWorkflow {
 	 * @param float $amount   Transaction amount
 	 * @param array $draft_data_decoded Optional decoded draft data for condition evaluation
 	 * @param array $context  Optional context for condition evaluation
+	 * @param bool $lock_policy Read current levels under the submission owner's locks
 	 * @return bool           True if auto-approved
 	 */
-	private function checkAutoApproval($draft_id, $workflow, $amount, $draft_data_decoded = array(), $context = array())
+	private function checkAutoApproval($draft_id, $workflow, $amount, $draft_data_decoded = array(), $context = array(), $lock_policy = false)
 	{
-		$levels = get_approval_levels($workflow['id'], true);
+		$config = self::getTypeConfig($workflow['trans_type']);
+		if ($config && !empty($config['independent_approval']))
+			return false;
+		if (!$this->validateRegisteredAction('auto_approve', $workflow['trans_type'], $draft_data_decoded))
+			return false;
+		$levels = get_approval_levels($workflow['id'], true, $lock_policy);
 		$all_auto = true;
 
 		$condition_context = array_merge(array('amount' => $amount), $context);
@@ -941,6 +1121,9 @@ class ApprovalWorkflow {
 	 */
 	private function checkAutoApprovalAtLevel($draft_id, $workflow, $amount, $from_level)
 	{
+		$config = self::getTypeConfig($workflow['trans_type']);
+		if ($config && !empty($config['independent_approval']))
+			return false;
 		$levels = get_approval_levels($workflow['id'], true);
 		$all_auto = true;
 
@@ -958,6 +1141,8 @@ class ApprovalWorkflow {
 			}
 		}
 		$condition_context = array('amount' => $amount);
+		if (!$this->validateRegisteredAction('auto_approve', $draft['trans_type'], $draft_data_decoded))
+			return false;
 
 		while ($level = db_fetch($levels)) {
 			if ((int)$level['level'] < $from_level)
@@ -1027,7 +1212,11 @@ class ApprovalWorkflow {
 		}
 
 		if ($result !== false) {
-			$posted_trans_no = is_int($result) ? $result : (int)$draft['reserved_trans_no'];
+			// PDO insert identities are canonical numeric strings. Preserve the
+			// actual writer identity; true-only legacy executors use the reservation.
+			$posted_trans_no = (is_int($result) || (is_string($result)
+				&& (string)(int)$result === $result && (int)$result > 0))
+				? (int)$result : (int)$draft['reserved_trans_no'];
 			update_approval_draft_trans_no($draft_id, $posted_trans_no);
 		}
 
@@ -1070,16 +1259,67 @@ class ApprovalWorkflow {
 		);
 	}
 
+    /**
+     * Acquire opted-in family locks before a selected draft can invert their order.
+     * The caller's unlocked probe selects a registration only. Each action then
+     * locks the current draft and rejects type drift; validators own authority.
+     * Missing, failed or throwing lockers fail closed in the caller transaction.
+     */
+    private function lockRegisteredActionFamily($probe)
+    {
+        if (!$probe) return false;
+        $config = self::getTypeConfig((int)$probe['trans_type']);
+        if ($config && !empty($config['action_locker'])) {
+            if (empty($GLOBALS['transaction_level'])) return false;
+            if (!is_callable($config['action_locker'])) return false;
+            try {
+                if (call_user_func($config['action_locker'], $probe,
+                    array('user_id'=>$this->user_id, 'role_id'=>$this->role_id)) !== true) return false;
+            } catch (Exception $exception) { return false;
+            } catch (Throwable $exception) { return false; }
+        }
+        return true;
+    }
+
+    /** Verify opted-in actions after all core writes, before relinquishing SQL ownership. */
+    private function validateRegisteredCompletion($outcome, $draft, $comments)
+    {
+        $config = self::getTypeConfig((int)$draft['trans_type']);
+        if (!$config || empty($config['action_completion_validator'])) return true;
+        if (!is_callable($config['action_completion_validator'])) return false;
+        try {
+            return call_user_func($config['action_completion_validator'], $outcome, $draft,
+                array('user_id'=>$this->user_id, 'role_id'=>$this->role_id), $comments) === true;
+        } catch (Exception $exception) { return false;
+        } catch (Throwable $exception) { return false; }
+    }
+
+    /** Validate only opted-in transaction types using the real service identity and decoded data. */
+    private function validateRegisteredAction($action, $trans_type, $data, $draft=null, $comments='')
+    {
+        $config=self::getTypeConfig((int)$trans_type);
+        if (!$config || empty($config['action_validator'])) return true;
+        if (!is_callable($config['action_validator'])) return false;
+        if ($data===null && is_array($draft)) {
+            $ok=false;$data=$this->decodeDraftData($draft['draft_data'],$ok);
+            if (!$ok) return false;
+        }
+        return call_user_func($config['action_validator'],$action,$data,$draft,
+            array('user_id'=>$this->user_id,'role_id'=>$this->role_id),$comments)===true;
+    }
+
 	/**
 	 * Get the security role ID for a delegating user.
 	 *
 	 * @param int $user_id User ID
+	 * @param bool $lock_policy Lock the current delegator role
 	 * @return int         Role ID
 	 */
-	private function getDelegatorRole($user_id)
+	private function getDelegatorRole($user_id, $lock_policy = false)
 	{
 		$sql = "SELECT role_id FROM " . TB_PREF . "users
 			WHERE id = " . db_escape($user_id);
+		if ($lock_policy) $sql .= ' FOR UPDATE';
 
 		$result = db_query($sql, 'could not get delegator role');
 		$row = db_fetch($result);

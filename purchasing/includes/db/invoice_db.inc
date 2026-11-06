@@ -127,8 +127,31 @@ function get_diff_in_home_currency($supplier, $old_date, $date, $amount1, $amoun
 }
 //----------------------------------------------------------------------------------------
 
+/** Capture approved invoice inputs while excluding the generated transaction number. */
+function supplier_invoice_approved_intent($invoice) {
+	$state = array();
+	foreach (array('trans_type','supplier_id','tran_date','due_date','dimension','dimension2','reference',
+		'supp_reference','Comments','tax_included','tax_group_id','tax_overrides','currency','ex_rate',
+		'ov_discount') as $field)
+		$state[$field] = isset($invoice->$field) ? $invoice->$field : null;
+	foreach (array('grn_items','gl_codes') as $field) {
+		$state[$field] = array();
+		$fields = $field === 'grn_items'
+			? array('id','po_detail_item','item_code','item_description','qty_recd','prev_quantity_inv',
+				'this_quantity_inv','order_price','chg_price','std_cost_unit','gl_code','tax_included')
+			: array('gl_code','gl_dim','gl_dim2','amount','memo_');
+		foreach ($invoice->$field as $key => $line) {
+			$state[$field][$key] = array();
+			foreach ($fields as $name) $state[$field][$key][$name] = isset($line->$name) ? $line->$name : null;
+		}
+	}
+	return $state;
+}
+
 function add_supp_invoice(&$supp_trans, $options = array()) {
 	global $Refs;
+	$preserve_approved_intent = !empty($options['preserve_approved_intent']);
+	$approved_intent = $preserve_approved_intent ? supplier_invoice_approved_intent($supp_trans) : null;
 
 	$skip_matching = isset($options['skip_matching']) && $options['skip_matching'];
 
@@ -167,13 +190,21 @@ function add_supp_invoice(&$supp_trans, $options = array()) {
 	}
 
 	$trans_no = $supp_trans->trans_no;
+	if ($preserve_approved_intent && supplier_invoice_approved_intent($supp_trans) !== $approved_intent)
+		throw new RuntimeException('Approved direct invoice intent changed during matching.');
 	$trans_type = $supp_trans->trans_type;
 	$supplier = suppliers_entity::find($supp_trans->supplier_id);
 	$dim = !empty($supp_trans->dimension) ? $supp_trans->dimension : ($supplier['dimension_id'] ? $supplier['dimension_id'] : 0);
 	$dim2 = !empty($supp_trans->dimension2) ? $supp_trans->dimension2 : ($supplier['dimension2_id'] ? $supplier['dimension2_id'] : 0);
 
 	begin_transaction();
+	if ($preserve_approved_intent) {
+		include_once(dirname(__FILE__).'/direct_purchase_integrity_db.inc');
+		$effect_context = direct_purchase_effect_context();
+	}
 	hook_db_prewrite($supp_trans, $trans_type);
+	if ($preserve_approved_intent && supplier_invoice_approved_intent($supp_trans) !== $approved_intent)
+		throw new RuntimeException('Approved direct invoice intent changed before posting.');
 	$tax_total = 0;
 	$taxes = $supp_trans->get_taxes($supp_trans->tax_group_id);
 	if ($trans_no) {
@@ -230,7 +261,7 @@ function add_supp_invoice(&$supp_trans, $options = array()) {
 			if (isset($taxitem['Override'])) {
 				if ($supp_trans->tax_included) { // if tax included, fix net amount to preserve overall line price
 					$net_diff += $taxitem['Override'] - $taxitem['Value'];
-					$taxitem['Net'] += $taxitem['Override'] - $taxitem['Value'];
+					$taxitem['Net'] -= $taxitem['Override'] - $taxitem['Value'];
 				}
 				$taxitem['Value'] = $taxitem['Override'];
 			}
@@ -390,6 +421,7 @@ function add_supp_invoice(&$supp_trans, $options = array()) {
 	reallocate_payments($invoice_id, ST_SUPPINVOICE, $date_, $to_allocate, $allocs, $supp_trans->supplier_id);
 	$supp_trans->trans_no = $invoice_id;
 
+	$native_effects = $preserve_approved_intent ? direct_purchase_native_effect_state($trans_type, $invoice_id, $effect_context) : null;
 	if ((int)$trans_type == ST_SUPPINVOICE && !$skip_matching && function_exists('perform_3way_match')) {
 		$post_match_result = perform_3way_match(
 			(int)$trans_type,
@@ -406,6 +438,12 @@ function add_supp_invoice(&$supp_trans, $options = array()) {
 	}
 
 	hook_db_postwrite($supp_trans, $supp_trans->trans_type);
+	if ($preserve_approved_intent && (supplier_invoice_approved_intent($supp_trans) !== $approved_intent
+		|| (string)$supp_trans->trans_no !== (string)$invoice_id))
+		throw new RuntimeException('Approved direct invoice intent changed at completion.');
+	if ($preserve_approved_intent)
+		direct_purchase_assert_native_effects($native_effects,
+			direct_purchase_native_effect_state($trans_type, $invoice_id, $effect_context));
 	commit_transaction();
 	if ((int)$trans_type == ST_SUPPINVOICE && function_exists('get_purch_agreement_ids_for_po_detail_items')
 		&& function_exists('update_agreement_fulfillment')) {

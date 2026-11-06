@@ -17,6 +17,17 @@ include_once($path_to_root.'/purchasing/includes/purchasing_ui.inc');
 include_once($path_to_root.'/purchasing/includes/db/suppliers_db.inc');
 include_once($path_to_root.'/reporting/includes/reporting.inc');
 
+// A new GET may deliberately replace an old cart. Never rebind a stale POST,
+// including a form whose query string still contains NewOrder/ModifyOrderNumber.
+if (isset($_SESSION['PO']) && (!is_object($_SESSION['PO'])
+	|| !method_exists($_SESSION['PO'], 'is_current_company') || !$_SESSION['PO']->is_current_company())
+	&& (!empty($_POST) || (!isset($_GET['NewOrder']) && !isset($_GET['NewGRN'])
+		&& !isset($_GET['NewInvoice']) && !isset($_GET['ModifyOrderNumber'])))) {
+	page(_('Purchase Order'));
+	display_error(_('This purchase cart belongs to another company or an older session. Start a new document or reload the order in the current company.'));
+	display_footer_exit();
+}
+
 set_page_security( @$_SESSION['PO']->trans_type,
 	array(	ST_PURCHORDER => 'SA_PURCHASEORDER',
 			ST_SUPPRECEIVE => 'SA_GRN',
@@ -29,6 +40,10 @@ set_page_security( @$_SESSION['PO']->trans_type,
 			'NewInvoice' => 'SA_SUPPLIERINVOICE',
 			'AddedPI' => 'SA_SUPPLIERINVOICE')
 );
+
+// create_new_po() can read an existing order before page() renders. Admit the
+// actual native mode before loading any source or allocating its reference.
+check_page_security($page_security);
 
 $js = '';
 if ($SysPrefs->use_popup_windows)
@@ -277,8 +292,10 @@ function handle_cancel_po() {
 
 	$fixed_asset = $_SESSION['PO']->fixed_asset;
 
-	if($_SESSION['PO']->order_no != 0)
-		delete_po($_SESSION['PO']->order_no);
+	if($_SESSION['PO']->order_no != 0) {
+		if (!delete_po($_SESSION['PO']->order_no))
+			return;
+	}
 	else {
 		unset($_SESSION['PO']);
 
@@ -496,44 +513,32 @@ function handle_commit_order() {
 		new_doc_date($cart->orig_order_date);
 		if ($cart->order_no == 0) { // new po/grn/invoice
 
-			// --- Approval workflow check (new orders only) ---
 			$trans_type = $cart->trans_type;
-			if ($trans_type == ST_PURCHORDER || $trans_type == ST_SUPPINVOICE) {
-				$draft_data = collect_purchase_order_data($cart);
-				$amount = $cart->get_trans_total();
-				$approval_result = approval_check_before_save($trans_type, $draft_data, $amount, array(
-					'summary'     => sprintf(_('%s from %s'), ($trans_type == ST_PURCHORDER ? _('Purchase Order') : _('Supplier Invoice')), $cart->supplier_name),
-					'currency'    => $cart->curr_code,
-					'person_type' => PT_SUPPLIER,
-					'person_id'   => $cart->supplier_id,
-				));
-				if ($approval_result !== false && $approval_result['status'] === 'auto_approved') {
-					$trans_no = isset($approval_result['trans_no']) ? $approval_result['trans_no'] : 0;
-					unset($_SESSION['PO']);
-					if ($trans_type == ST_PURCHORDER)
-						meta_forward($_SERVER['PHP_SELF'], 'AddedID='.$trans_no);
-					else
-						meta_forward($_SERVER['PHP_SELF'], 'AddedPI='.$trans_no);
-				}
-				if ($approval_result !== false) {
-					return; // pending approval
-				}
+			$result = submit_or_post_purchase_document($cart, array(
+				'summary'=>sprintf(_('%s from %s'), ($trans_type == ST_PURCHORDER ? _('Purchase Order') : _('Supplier Invoice')), $cart->supplier_name),
+				'currency'=>$cart->curr_code, 'person_type'=>PT_SUPPLIER, 'person_id'=>$cart->supplier_id,
+			));
+			if ($result === false) return;
+			if ($result['status'] === 'pending') {
+				display_notification_centered(sprintf(_('Transaction has been submitted for approval. Draft #%d, Reference: %s'), $result['draft_id'], $result['reference']));
+				display_note(_('The transaction is now pending approval. You can track its status on the Approval Dashboard.'), 0, 1);
+				hyperlink_no_params('admin/approval_dashboard.php', _('Go to Approval Dashboard'));
+				display_footer_exit();
+				return;
 			}
-			// --- End approval check ---
-
-			$trans_no = add_direct_supp_trans($cart);
-			if ($trans_no) {
-				unset($_SESSION['PO']);
-				if ($cart->trans_type == ST_PURCHORDER)
-					meta_forward($_SERVER['PHP_SELF'], 'AddedID='.$trans_no);
-				elseif ($cart->trans_type == ST_SUPPRECEIVE)
-					meta_forward($_SERVER['PHP_SELF'], 'AddedGRN='.$trans_no);
-				else
-					meta_forward($_SERVER['PHP_SELF'], 'AddedPI='.$trans_no);
-			}
+			$trans_no = $result['trans_no'];
+			unset($_SESSION['PO']);
+			if ($trans_type == ST_PURCHORDER)
+				meta_forward($_SERVER['PHP_SELF'], 'AddedID='.$trans_no);
+			elseif ($trans_type == ST_SUPPRECEIVE)
+				meta_forward($_SERVER['PHP_SELF'], 'AddedGRN='.$trans_no);
+			else
+				meta_forward($_SERVER['PHP_SELF'], 'AddedPI='.$trans_no);
 		}
 		else { // order modification
 			$order_no = update_po($cart);
+			if (!$order_no)
+				return;
 			unset($_SESSION['PO']);
 			meta_forward($_SERVER['PHP_SELF'], 'AddedID='.$order_no.'&Updated=1');	
 		}

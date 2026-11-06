@@ -134,7 +134,13 @@ function get_purchase_data($supplier_id, $stock_id) {
 }
 
 function add_or_update_purchase_data($supplier_id, $stock_id, $price, $description='', $uom='') {
-	$data = get_purchase_data($supplier_id, $stock_id);
+	require_once __DIR__.'/../../dimensions/includes/dimension_composite_metadata_writer.inc';
+	if (!begin_transaction()) dimension_financial_reference_failure();
+	try {
+	$key=array('supplier_id'=>$supplier_id,'stock_id'=>$stock_id);
+	$rows=dimension_composite_metadata_rows('purch_data',$key);
+	if (!$rows || db_num_rows($rows)>1) dimension_financial_reference_failure();
+	$data=db_num_rows($rows)?db_fetch_assoc($rows):false;
 
 	$description = substr($description, 0, 50); // FIXME: temporary constraint to avoid db errors on long descriptions, see [0005170]
 	if ($data === false) {
@@ -142,10 +148,9 @@ function add_or_update_purchase_data($supplier_id, $stock_id, $price, $descripti
 			conversion_factor, supplier_description) VALUES (".db_escape($supplier_id)
 			.", ".db_escape($stock_id).", ".db_escape($price).", "
 			.db_escape($uom).", 1, ".db_escape($description).")";
-		db_query($sql, 'The supplier purchasing details could not be added');
-		if (function_exists('sync_purchase_data_to_vendor_pricelist'))
-			sync_purchase_data_to_vendor_pricelist($supplier_id, $stock_id);
-		return;
+		if (!dimension_composite_metadata_write('purch_data',null,array(),function($admitted)use($sql,$supplier_id,$stock_id){if(!db_query($sql, 'The supplier purchasing details could not be added'))return false;return !function_exists('sync_purchase_data_to_vendor_pricelist') || sync_purchase_data_to_vendor_pricelist($supplier_id,$stock_id);},false,$key)) dimension_financial_reference_failure();
+		if (!commit_transaction()) dimension_financial_reference_failure();
+		return true;
 	}	
 	//$price = round($price * $data['conversion_factor'], user_price_dec());
 	$sql = "UPDATE ".TB_PREF."purch_data SET price=".db_escape($price);
@@ -154,10 +159,10 @@ function add_or_update_purchase_data($supplier_id, $stock_id, $price, $descripti
 	if ($description != '')
 		$sql .= ",supplier_description=".db_escape($description);
 	$sql .= " WHERE stock_id=".db_escape($stock_id)." AND supplier_id=".db_escape($supplier_id);
-	db_query($sql, 'The supplier purchasing details could not be updated');
-	if (function_exists('sync_purchase_data_to_vendor_pricelist'))
-		sync_purchase_data_to_vendor_pricelist($supplier_id, $stock_id);
+	if (!dimension_composite_metadata_write('purch_data',$key,array(),function($admitted)use($sql,$supplier_id,$stock_id){if(!db_query($sql, 'The supplier purchasing details could not be updated'))return false;return !function_exists('sync_purchase_data_to_vendor_pricelist') || sync_purchase_data_to_vendor_pricelist($supplier_id,$stock_id);})) dimension_financial_reference_failure();
+	if (!commit_transaction()) dimension_financial_reference_failure();
 	return true;
+	} catch (Exception $e) {cancel_transaction();throw $e;} catch (Throwable $e) {cancel_transaction();throw $e;}
 }
 
 function get_po_prepayments($supp_trans) {
@@ -188,81 +193,282 @@ function get_po_prepayments($supp_trans) {
 //
 //	Add Purchase Order, GRN or Purchase Invoice with parent auto documents (if any)
 //
-function add_direct_supp_trans($cart) {
-	global $Refs, $type_shortcuts;
-
-	if ($cart->trans_type != ST_PURCHORDER) {
-		// for direct grn/invoice set same dates for lines as for whole document
-		foreach ($cart->line_items as $line_no =>$line)
-			$cart->line_items[$line_no]->req_del_date = $cart->orig_order_date;
-	}
-
-	$ref = $cart->reference;
-	if ($cart->trans_type != ST_PURCHORDER) {
-		$cart->reference = 'auto';
-		begin_transaction();	// all db changes as single transaction for direct document
-	}
-	$order_no = add_po($cart);
-	$cart->order_no = $order_no;
-
-	if ($cart->trans_type == ST_PURCHORDER)
-		return $order_no;
-
-	//Direct GRN
-	if ($cart->trans_type == ST_SUPPRECEIVE)
-		$cart->reference = $ref;
-	if ($cart->trans_type != ST_SUPPINVOICE)
-		$cart->Comments = $cart->reference; //grn does not hold supp_ref
-	foreach($cart->line_items as $key => $line)
-		$cart->line_items[$key]->receive_qty = $line->quantity;
-	$grn_no = add_grn($cart);
-	if ($cart->trans_type == ST_SUPPRECEIVE) {
-		commit_transaction(); // save PO+GRN
-		return $grn_no;
-	}
-	//	Direct Purchase Invoice
-	$inv = new supp_trans(ST_SUPPINVOICE);
-	$inv->Comments = $cart->Comments;
-	$inv->supplier_id = $cart->supplier_id;
-	$inv->tran_date = $cart->orig_order_date;
-	$inv->due_date = $cart->due_date;
-	$inv->dimension = $cart->dimension;
-	$inv->dimension2 = $cart->dimension2;
-	$inv->reference = $ref;
-	$inv->supp_reference = $cart->supp_ref;
-	$inv->tax_included = $cart->tax_included;
-	$supp = suppliers_entity::find($cart->supplier_id);
-	$inv->tax_group_id = $supp['tax_group_id'];
-	$inv->ov_amount = $inv->ov_gst = $inv->ov_discount = 0;
-	$total = 0;
-		foreach($cart->line_items as $key => $line) {
-		$inv->add_grn_to_trans($line->grn_item_id, $line->po_detail_rec, $line->stock_id,
-			$line->item_description, $line->receive_qty, 0, $line->receive_qty,
-			$line->price, $line->price, true, get_unit_cost($line->stock_id), '');
-		$total += round2(($line->receive_qty * $line->price), user_price_dec());
-	}
-	$inv->tax_overrides = $cart->tax_overrides;
-	if (!$inv->tax_included) {
-		$taxes = $inv->get_taxes($inv->tax_group_id, 0, false);
-		foreach( $taxes as $taxitem) {
-			$total += isset($taxitem['Override']) ? $taxitem['Override'] : $taxitem['Value'];
-		}
-	}
-	$inv->currency = $cart->curr_code;
-	$inv->ex_rate = $cart->ex_rate;
-
-	$inv_no = add_supp_invoice($inv);
-	if (!$inv_no) {
-		cancel_transaction();
+/** Recheck current accounting-period settings under the owning direct-document transaction. */
+function direct_supplier_period_authorized($cart) {
+	if (empty($GLOBALS['transaction_level']) || !is_string($cart->orig_order_date) || !is_date($cart->orig_order_date))
 		return false;
+	$date = date2sql($cart->orig_order_date);
+	$result = db_query("SELECT name,value FROM ".TB_PREF."sys_prefs WHERE name IN ('f_year','gl_closing_date')"
+		." ORDER BY name FOR UPDATE", 'Could not verify current purchasing period settings');
+	if (!$result)
+		return false;
+	$settings = array();
+	while ($row = db_fetch($result))
+		$settings[$row['name']] = $row['value'];
+	if (!isset($settings['f_year'], $settings['gl_closing_date'])
+		|| (string)(int)$settings['f_year'] !== (string)$settings['f_year'] || (int)$settings['f_year'] <= 0)
+		return false;
+	$closing_date = $settings['gl_closing_date'];
+	if ($closing_date !== '' && $closing_date !== '0000-00-00') {
+		if (!preg_match('/^([0-9]{4})-([0-9]{2})-([0-9]{2})$/D', $closing_date, $parts)
+			|| !checkdate((int)$parts[2], (int)$parts[3], (int)$parts[1]) || $date <= $closing_date)
+			return false;
 	}
+	$sql = "SELECT id,begin,end,closed FROM ".TB_PREF."fiscal_year WHERE ";
+	if ($_SESSION['wa_current_user']->can_access('SA_MULTIFISCALYEARS'))
+		$sql .= "begin<=".db_escape($date)." AND end>=".db_escape($date);
+	else
+		$sql .= "id=".db_escape($settings['f_year']);
+	$result = db_query($sql.' ORDER BY id FOR UPDATE', 'Could not verify current purchasing fiscal year');
+	if (!$result)
+		return false;
+	while ($year = db_fetch($result))
+		if ((string)$year['closed'] === '0' && $year['begin'] <= $date && $date <= $year['end'])
+			return true;
+	return false;
+}
 
-	if ($cart->cash_account) {
-		$pmt_no = write_supp_payment(0, $inv->supplier_id, $cart->cash_account,	$inv->tran_date, $Refs->get_next(ST_SUPPAYMENT, null, $inv->tran_date), $total, 0, _('Payment for:').$inv->supp_reference.' ('.$type_shortcuts[ST_SUPPINVOICE].$inv_no.')'.' '.$cart->Comments, 0, 0, $cart->dimension, $cart->dimension2);
-		add_supp_allocation($total, ST_SUPPAYMENT, $pmt_no, ST_SUPPINVOICE, $inv_no, $inv->supplier_id, $inv->tran_date);
-		update_supp_trans_allocation(ST_SUPPINVOICE, $inv_no, $inv->supplier_id);
-		update_supp_trans_allocation(ST_SUPPAYMENT, $pmt_no, $inv->supplier_id);
+/** Recheck the admitted company, command identity and current role between direct stages. */
+function direct_supplier_transaction_authorized($cart, $original, $order_no, $creation_context = null) {
+	return purchase_order_creation_authorized($original)
+		&& ($creation_context === null || purchase_order_creation_context($cart) === $creation_context)
+		&& $cart->is_current_company()
+		&& (string)$cart->order_no === (string)$order_no
+		&& (string)$cart->company === (string)$original->company
+		&& $cart->company_prefix === $original->company_prefix
+		&& $cart->trans_type === $original->trans_type
+		&& (string)$cart->supplier_id === (string)$original->supplier_id
+		&& $cart->orig_order_date === $original->orig_order_date
+		&& direct_supplier_period_authorized($cart);
+}
+
+/** Publish generated direct-document identities only after the complete native command succeeds. */
+function publish_direct_supplier_cart($cart, $submitted_cart) {
+	foreach (get_object_vars($cart) as $key => $value)
+		$submitted_cart->$key = $value;
+}
+
+/** Dispatch a native new document under one current core-policy transaction. */
+function submit_or_post_purchase_document($cart, $context = array()) {
+	global $path_to_root;
+	if (!purchase_order_creation_authorized($cart) || !class_exists('ApprovalWorkflow'))
+		return false;
+	$type = $cart->trans_type;
+	$identity = purchase_order_creation_context($cart);
+	$working = clone $cart;
+	foreach ($cart->line_items as $key => $line)
+		$working->line_items[$key] = clone $line;
+	if (!begin_transaction()) return false;
+	try {
+		$amount = $cart->get_trans_total();
+		if ($type == ST_PURCHORDER) $working->approval_gross_amount = $amount;
+		if ($type == ST_SUPPINVOICE) {
+			include_once($path_to_root.'/purchasing/includes/db/direct_purchase_integrity_db.inc');
+			$working->direct_finance_binding = direct_purchase_financial_binding($working);
+			$amount = $working->direct_finance_binding['amount'];
+		}
+		$approval = new ApprovalWorkflow($_SESSION['wa_current_user']->access, $_SESSION['wa_current_user']->user);
+		$governed = $type == ST_PURCHORDER || $type == ST_SUPPINVOICE;
+		if ($governed && !ApprovalWorkflow::isRegistered($type))
+			throw new RuntimeException('Purchase approval registration is unavailable.');
+		$required = $governed && $approval->isApprovalRequired($type, $amount, true);
+		if ($required) {
+			$data = collect_purchase_order_data($working);
+			if ($data === false) throw new RuntimeException('Purchase approval envelope is unavailable.');
+			$result = $approval->submit($type, $data, $amount, $context, true);
+			if (!in_array($result['status'], array('pending','auto_approved'), true))
+				throw new RuntimeException('Purchase approval submission failed.');
+		} else {
+			$number = add_direct_supp_trans($working);
+			if (!$number || ($governed && $approval->isApprovalRequired($type, $amount, true)))
+				throw new RuntimeException('Purchase posting or current approval policy changed.');
+			$result = array('status'=>'posted','trans_no'=>$number);
+		}
+		if (!purchase_order_creation_authorized($cart) || purchase_order_creation_context($cart) !== $identity
+			|| empty($GLOBALS['transaction_level']))
+			throw new RuntimeException('Purchase dispatch authority changed.');
+		if (!commit_transaction()) {
+			if (!empty($GLOBALS['transaction_level']))
+				throw new RuntimeException('Purchase dispatch commit failed.');
+			display_error(_('The purchase document was committed, but resource cleanup needs recovery. Reload it before continuing.'));
+		}
+		if (!$required) publish_direct_supplier_cart($working, $cart);
+		return $result;
+	} catch (Exception $exception) {
+		cancel_transaction();
+		display_error(_('The purchase document could not be submitted or posted. Reload it before retrying.'));
+		return false;
+	} catch (Throwable $exception) {
+		cancel_transaction();
+		throw $exception;
 	}
-	commit_transaction(); // save PO+GRN+PI(+SP)
-	return $inv_no;
+}
+
+/** Create a native direct document, optionally preserving its approved business intent. */
+function add_direct_supp_trans($cart, $preserve_approved_intent = false) {
+	global $Refs, $type_shortcuts, $path_to_root;
+	if (!purchase_order_creation_authorized($cart))
+		return false;
+	if ($cart->trans_type == ST_PURCHORDER)
+		return add_po($cart);
+	$creation_context = purchase_order_creation_context($cart);
+	$original = clone $cart;
+	foreach ($cart->line_items as $key => $line)
+		$original->line_items[$key] = clone $line;
+	// Native SQL errors can terminate a request rather than throw. Keep the
+	// session/submitted cart unchanged until the complete command commits.
+	$submitted_cart = $cart;
+	$cart = clone $cart;
+	foreach ($cart->line_items as $key => $line)
+		$cart->line_items[$key] = clone $line;
+	if (!begin_transaction())
+		return false;
+	try {
+		if (!direct_supplier_period_authorized($cart))
+			throw new RuntimeException('Direct purchasing accounting period is closed or unavailable.');
+		if ($preserve_approved_intent) {
+			include_once($path_to_root.'/purchasing/includes/db/direct_purchase_integrity_db.inc');
+			$effect_context = direct_purchase_effect_context();
+			$financial_binding = direct_purchase_financial_binding($cart,
+				isset($cart->direct_finance_binding) ? $cart->direct_finance_binding : null);
+		}
+		if ($cart->trans_type != ST_PURCHORDER) {
+			// for direct grn/invoice set same dates for lines as for whole document
+			foreach ($cart->line_items as $line_no =>$line)
+				$cart->line_items[$line_no]->req_del_date = $cart->orig_order_date;
+		}
+
+		$ref = $cart->reference;
+		if ($cart->trans_type != ST_PURCHORDER) {
+			$cart->reference = 'auto';
+		}
+		$order_no = add_po($cart, 0, $preserve_approved_intent);
+		if (!$order_no)
+			throw new RuntimeException('Direct purchase order parent failed.');
+		$cart->order_no = $order_no;
+		if (!direct_supplier_transaction_authorized($cart, $original, $order_no, $creation_context))
+			throw new RuntimeException('Direct purchase authority changed after parent creation.');
+		$parent_effects = $preserve_approved_intent ? purchase_order_creation_native_state($order_no) : null;
+		if ($preserve_approved_intent) direct_purchase_financial_binding($cart, $financial_binding);
+
+		//Direct GRN
+		if ($cart->trans_type == ST_SUPPRECEIVE)
+			$cart->reference = $ref;
+		if ($cart->trans_type != ST_SUPPINVOICE)
+			$cart->Comments = $cart->reference; //grn does not hold supp_ref
+		foreach($cart->line_items as $key => $line)
+			$cart->line_items[$key]->receive_qty = $line->quantity;
+		$grn_no = add_grn($cart, $preserve_approved_intent);
+		if (!$grn_no)
+			throw new RuntimeException('Direct goods receipt failed.');
+		if (!direct_supplier_transaction_authorized($cart, $original, $order_no, $creation_context))
+			throw new RuntimeException('Direct purchase authority changed after receipt.');
+		if ($preserve_approved_intent) {
+			direct_purchase_financial_binding($cart, $financial_binding);
+			direct_purchase_assert_native_effects($parent_effects, purchase_order_creation_native_state($order_no));
+			$receipt_effects = direct_purchase_native_effect_state(ST_SUPPRECEIVE, $grn_no, $effect_context, false);
+		}
+		if ($cart->trans_type == ST_SUPPRECEIVE) {
+			if (!commit_transaction()) {
+				if (!empty($GLOBALS['transaction_level']))
+					throw new RuntimeException('Direct purchase commit failed.');
+				display_error(_('The purchase document was committed, but resource cleanup needs recovery. Reload it before continuing.'));
+			}
+			publish_direct_supplier_cart($cart, $submitted_cart);
+			return $grn_no;
+		}
+		//	Direct Purchase Invoice
+		$inv = new supp_trans(ST_SUPPINVOICE);
+		$inv->Comments = $cart->Comments;
+		$inv->supplier_id = $cart->supplier_id;
+		$inv->tran_date = $cart->orig_order_date;
+		$inv->due_date = $cart->due_date;
+		$inv->dimension = $cart->dimension;
+		$inv->dimension2 = $cart->dimension2;
+		$inv->reference = $ref;
+		$inv->supp_reference = $cart->supp_ref;
+		$inv->tax_included = $cart->tax_included;
+		$supp = suppliers_entity::find($cart->supplier_id);
+		$inv->tax_group_id = $supp['tax_group_id'];
+		$inv->ov_amount = $inv->ov_gst = $inv->ov_discount = 0;
+		$total = 0;
+			foreach($cart->line_items as $key => $line) {
+			$inv->add_grn_to_trans($line->grn_item_id, $line->po_detail_rec, $line->stock_id,
+				$line->item_description, $line->receive_qty, 0, $line->receive_qty,
+				$line->price, $line->price, true, get_unit_cost($line->stock_id), '');
+			$total += round2(($line->receive_qty * $line->price), user_price_dec());
+		}
+		$inv->tax_overrides = $cart->tax_overrides;
+		if (!$inv->tax_included) {
+			$taxes = $inv->get_taxes($inv->tax_group_id, 0, false);
+			foreach( $taxes as $taxitem) {
+				$total += isset($taxitem['Override']) ? $taxitem['Override'] : $taxitem['Value'];
+			}
+		}
+		$inv->currency = $cart->curr_code;
+		$inv->ex_rate = $cart->ex_rate;
+
+		$inv_no = add_supp_invoice($inv, array('preserve_approved_intent'=>$preserve_approved_intent));
+		if (!$inv_no)
+			throw new RuntimeException('Direct supplier invoice failed.');
+		if (!direct_supplier_transaction_authorized($cart, $original, $order_no, $creation_context)
+			|| (string)$inv->supplier_id !== (string)$original->supplier_id || $inv->trans_type != ST_SUPPINVOICE
+			|| $inv->tran_date !== $original->orig_order_date)
+			throw new RuntimeException('Direct purchase authority changed after invoice.');
+		if ($preserve_approved_intent) {
+			direct_purchase_financial_binding($cart, $financial_binding);
+			direct_purchase_assert_native_effects($parent_effects, purchase_order_creation_native_state($order_no));
+			direct_purchase_assert_native_effects($receipt_effects,
+				direct_purchase_native_effect_state(ST_SUPPRECEIVE, $grn_no, $effect_context, false));
+			$invoice_effects = direct_purchase_native_effect_state(ST_SUPPINVOICE, $inv_no, $effect_context, false);
+			$posted_invoice = $invoice_effects['header'][0];
+			if (round2($posted_invoice['ov_amount'] + $posted_invoice['ov_gst'] + $posted_invoice['ov_discount']
+				- $financial_binding['amount'], $financial_binding['precision']) != 0)
+				throw new RuntimeException('Native direct invoice total differs from its approved gross amount.');
+		}
+
+		if ($cart->cash_account) {
+			$pmt_no = write_supp_payment(0, $inv->supplier_id, $cart->cash_account,	$inv->tran_date, $Refs->get_next(ST_SUPPAYMENT, null, $inv->tran_date), $total, 0, _('Payment for:').$inv->supp_reference.' ('.$type_shortcuts[ST_SUPPINVOICE].$inv_no.')'.' '.$cart->Comments, 0, 0, $cart->dimension, $cart->dimension2, $preserve_approved_intent);
+			if (!$pmt_no)
+				throw new RuntimeException('Direct supplier payment failed.');
+			if (!direct_supplier_transaction_authorized($cart, $original, $order_no, $creation_context))
+				throw new RuntimeException('Direct purchase authority changed after payment.');
+			add_supp_allocation($total, ST_SUPPAYMENT, $pmt_no, ST_SUPPINVOICE, $inv_no, $inv->supplier_id, $inv->tran_date);
+			update_supp_trans_allocation(ST_SUPPINVOICE, $inv_no, $inv->supplier_id);
+			update_supp_trans_allocation(ST_SUPPAYMENT, $pmt_no, $inv->supplier_id);
+			if ($preserve_approved_intent)
+				direct_purchase_assert_cash_allocation($inv_no, $pmt_no, $inv->supplier_id, $total, $inv->tran_date, $effect_context);
+		}
+		if ($preserve_approved_intent) {
+			direct_purchase_financial_binding($cart, $financial_binding);
+			direct_purchase_assert_native_effects($parent_effects, purchase_order_creation_native_state($order_no));
+			direct_purchase_assert_native_effects($receipt_effects,
+				direct_purchase_native_effect_state(ST_SUPPRECEIVE, $grn_no, $effect_context, false));
+			direct_purchase_assert_native_effects($invoice_effects,
+				direct_purchase_native_effect_state(ST_SUPPINVOICE, $inv_no, $effect_context, false));
+		}
+		if (!commit_transaction()) {
+			if (!empty($GLOBALS['transaction_level']))
+				throw new RuntimeException('Direct purchase commit failed.');
+			display_error(_('The purchase document was committed, but resource cleanup needs recovery. Reload it before continuing.'));
+		}
+		publish_direct_supplier_cart($cart, $submitted_cart);
+		return $inv_no;
+	} catch (Exception $exception) {
+		cancel_transaction();
+		foreach (get_object_vars($cart) as $key => $value)
+			if (!property_exists($original, $key))
+				unset($cart->$key);
+		foreach (get_object_vars($original) as $key => $value)
+			$cart->$key = $value;
+		return false;
+	} catch (Throwable $exception) {
+		cancel_transaction();
+		foreach (get_object_vars($cart) as $key => $value)
+			if (!property_exists($original, $key))
+				unset($cart->$key);
+		foreach (get_object_vars($original) as $key => $value)
+			$cart->$key = $value;
+		throw $exception;
+	}
 }

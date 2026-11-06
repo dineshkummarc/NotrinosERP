@@ -11,6 +11,8 @@
 ***********************************************************************/
 
 include_once($path_to_root . '/includes/approval/ui/approval_ui.inc');
+include_once($path_to_root . '/inventory/warehouse/includes/db/warehouse_material_po_approval_db.inc');
+include_once($path_to_root . '/purchasing/includes/db/purch_requisition_reopen_db.inc');
 
 // =====================================================
 // TRANSACTION TYPE REGISTRATIONS
@@ -20,6 +22,8 @@ ApprovalWorkflow::registerTransactionType(ST_PURCHORDER, array(
 	'label'          => _('Purchase Order'),
 	'application'    => 'AP',
 	'executor'       => 'execute_approved_purchase_order',
+	'action_validator' => 'validate_purchase_order_source_action',
+	'action_completion_validator' => 'verify_material_purchase_order_completion',
 	'amount_getter'  => 'get_purchase_draft_amount',
 	'draft_renderer' => 'render_purchase_draft',
 	'edit_url'       => 'purchasing/po_entry_items.php',
@@ -29,6 +33,7 @@ ApprovalWorkflow::registerTransactionType(ST_SUPPINVOICE, array(
 	'label'          => _('Supplier Invoice'),
 	'application'    => 'AP',
 	'executor'       => 'execute_approved_supplier_invoice',
+	'action_validator' => 'validate_direct_supplier_financial_action',
 	'amount_getter'  => 'get_purchase_draft_amount',
 	'draft_renderer' => 'render_purchase_draft',
 	'edit_url'       => 'purchasing/supplier_invoice.php',
@@ -36,14 +41,19 @@ ApprovalWorkflow::registerTransactionType(ST_SUPPINVOICE, array(
 
 ApprovalWorkflow::registerTransactionType(ST_PURCHREQUISITION, array(
 	'label'          => _('Purchase Requisition'),
+	'independent_approval' => true,
 	'application'    => 'AP',
 	'executor'       => 'execute_approved_purchase_requisition',
 	'rejector'       => 'reject_purchase_requisition_draft',
 	'canceler'       => 'cancel_purchase_requisition_draft',
+	'action_validator' => 'validate_purchase_requisition_reopen_action',
+	'action_completion_validator' => 'verify_purchase_requisition_core_completion',
 	'amount_getter'  => 'get_purchase_requisition_draft_amount',
 	'draft_renderer' => 'render_purchase_requisition_draft',
 	'edit_url'       => 'purchasing/purch_requisition_entry.php',
 ));
+
+require_once __DIR__.'/../../../purchasing/includes/db/purch_agreement_lifecycle_db.inc';
 
 ApprovalWorkflow::registerTransactionType(ST_PURCHAGREEMENT, array(
 	'label'          => _('Purchase Agreement'),
@@ -54,6 +64,9 @@ ApprovalWorkflow::registerTransactionType(ST_PURCHAGREEMENT, array(
 	'amount_getter'  => 'get_purchase_agreement_draft_amount',
 	'draft_renderer' => 'render_purchase_agreement_draft',
 	'edit_url'       => 'purchasing/purch_agreement_entry.php',
+	'action_locker' => 'lock_purchase_agreement_core_action',
+	'action_validator' => 'validate_purchase_agreement_core_action',
+	'action_completion_validator' => 'verify_purchase_agreement_core_completion',
 ));
 
 ApprovalWorkflow::registerTransactionType(ST_PROCUREMENTPLAN, array(
@@ -100,7 +113,7 @@ ApprovalWorkflow::registerTransactionType(ST_VENDOR_EVALUATION, array(
  * properties and line items from the JSON draft.
  *
  * @param array $data Draft data array (decoded JSON)
- * @return object Restored purch_order instance
+ * @return object|false Restored current-company cart, or false for an invalid/foreign envelope
  */
 function restore_purchase_order_from_data($data)
 {
@@ -108,6 +121,27 @@ function restore_purchase_order_from_data($data)
 	include_once($path_to_root . '/purchasing/includes/po_class.inc');
 
 	$po = new purch_order();
+	// Legacy envelopes are already company-scoped by the workflow's own row.
+	// New envelopes must never be silently rebound after a company switch.
+	if (!is_array($data) || array_key_exists('plan_conversion', $data) || array_key_exists('material_request_conversion', $data) || array_key_exists('agreement_conversion', $data) || array_key_exists('rfq_conversion', $data) || array_key_exists('requisition_conversion', $data) || !$po->is_current_company()
+		|| ((array_key_exists('company', $data) || array_key_exists('company_prefix', $data))
+			&& (!isset($data['company'], $data['company_prefix'])
+				|| !is_scalar($data['company']) || (string)$data['company'] !== (string)$po->company
+				|| $data['company_prefix'] !== $po->company_prefix)))
+		return false;
+	if (!isset($data['trans_type'], $data['supplier_id'], $data['line_items'])
+		|| !is_scalar($data['trans_type'])
+		|| !in_array((string)$data['trans_type'], array((string)ST_PURCHORDER, (string)ST_SUPPRECEIVE, (string)ST_SUPPINVOICE), true)
+		|| !is_scalar($data['supplier_id']) || (string)(int)$data['supplier_id'] !== (string)$data['supplier_id']
+		|| (int)$data['supplier_id'] <= 0 || !is_array($data['line_items']) || !$data['line_items'])
+		return false;
+	foreach ($data['line_items'] as $line_data) {
+		if (!is_array($line_data) || !isset($line_data['stock_id'], $line_data['quantity'], $line_data['price'])
+			|| !is_string($line_data['stock_id']) || $line_data['stock_id'] === ''
+			|| !is_numeric($line_data['quantity']) || !is_finite((float)$line_data['quantity']) || $line_data['quantity'] <= 0
+			|| !is_numeric($line_data['price']) || !is_finite((float)$line_data['price']))
+			return false;
+	}
 
 	$po->trans_type       = (int)$data['trans_type'];
 	$po->trans_no         = isset($data['trans_no']) ? $data['trans_no'] : 0;
@@ -130,6 +164,12 @@ function restore_purchase_order_from_data($data)
 	$po->terms            = isset($data['terms']) ? $data['terms'] : array();
 	$po->ex_rate          = isset($data['ex_rate']) ? $data['ex_rate'] : 1;
 	$po->cash_account     = isset($data['cash_account']) ? $data['cash_account'] : '';
+	if (array_key_exists('direct_finance_binding', $data))
+		$po->direct_finance_binding = $data['direct_finance_binding'];
+	if (array_key_exists('approval_gross_amount', $data)) {
+		if (!is_numeric($data['approval_gross_amount']) || !is_finite((float)$data['approval_gross_amount'])) return false;
+		$po->approval_gross_amount = $data['approval_gross_amount'];
+	}
 	$po->dimension        = isset($data['dimension']) ? (int)$data['dimension'] : 0;
 	$po->dimension2       = isset($data['dimension2']) ? (int)$data['dimension2'] : 0;
 	$po->tax_overrides    = isset($data['tax_overrides']) ? $data['tax_overrides'] : array();
@@ -239,12 +279,43 @@ function restore_supplier_trans_from_data($data)
 function execute_approved_purchase_order($draft_data, $reserved_trans_no, $draft_id)
 {
 	global $path_to_root;
+	if (!isset($_SESSION['wa_current_user'])
+		|| !$_SESSION['wa_current_user']->can_access('SA_PURCHASEORDER')
+		|| !is_array($draft_data) || !isset($draft_data['trans_type'])
+		|| !is_scalar($draft_data['trans_type']) || (string)$draft_data['trans_type'] !== (string)ST_PURCHORDER)
+		return false;
 	include_once($path_to_root . '/purchasing/includes/purchasing_db.inc');
+	$markers = array_intersect(array('plan_conversion','requisition_conversion','rfq_conversion','agreement_conversion','material_request_conversion'), array_keys($draft_data));
+	if (count($markers) > 1) return false;
+	if (array_key_exists('plan_conversion', $draft_data)) {
+		include_once($path_to_root.'/purchasing/includes/db/procurement_plan_po_approval_db.inc');
+		return execute_plan_purchase_order($draft_data, $reserved_trans_no, $draft_id);
+	}
+	if (array_key_exists('requisition_conversion', $draft_data)) {
+		include_once($path_to_root.'/purchasing/includes/db/purch_requisition_po_approval_db.inc');
+		return execute_requisition_purchase_order($draft_data, $reserved_trans_no, $draft_id);
+	}
+	if (array_key_exists('rfq_conversion', $draft_data)) {
+		include_once($path_to_root.'/purchasing/includes/db/purch_rfq_db.inc');
+		return !array_key_exists('agreement_conversion', $draft_data) && !array_key_exists('material_request_conversion', $draft_data)
+			? execute_rfq_purchase_order($draft_data, $reserved_trans_no, $draft_id) : false;
+	}
+	if (array_key_exists('agreement_conversion', $draft_data)) {
+		include_once($path_to_root.'/purchasing/includes/db/purch_agreement_db.inc');
+		include_once($path_to_root.'/purchasing/includes/db/purch_agreement_po_approval_db.inc');
+		return !array_key_exists('material_request_conversion', $draft_data)
+			? execute_agreement_purchase_order($draft_data, $reserved_trans_no, $draft_id) : false;
+	}
+	if (array_key_exists('material_request_conversion', $draft_data)) {
+		include_once($path_to_root . '/inventory/warehouse/includes/db/warehouse_material_requests_db.inc');
+		return execute_material_request_purchase_order($draft_data, $reserved_trans_no, $draft_id);
+	}
 
 	$po = restore_purchase_order_from_data($draft_data);
-	$po->trans_type = ST_PURCHORDER;
+	if ($po === false)
+		return false;
 
-	$order_no = add_direct_supp_trans($po);
+	$order_no = add_po($po, 0, true);
 
 	return $order_no ? $order_no : false;
 }
@@ -260,6 +331,11 @@ function execute_approved_purchase_order($draft_data, $reserved_trans_no, $draft
 function execute_approved_supplier_invoice($draft_data, $reserved_trans_no, $draft_id)
 {
 	global $path_to_root;
+	if (!isset($_SESSION['wa_current_user'])
+		|| !$_SESSION['wa_current_user']->can_access('SA_SUPPLIERINVOICE') || !is_array($draft_data)
+		|| (isset($draft_data['trans_type']) && (!is_scalar($draft_data['trans_type'])
+			|| (string)$draft_data['trans_type'] !== (string)ST_SUPPINVOICE)))
+		return false;
 	include_once($path_to_root . '/purchasing/includes/purchasing_db.inc');
 
 	if (isset($draft_data['grn_items']) || isset($draft_data['gl_codes'])) {
@@ -269,11 +345,38 @@ function execute_approved_supplier_invoice($draft_data, $reserved_trans_no, $dra
 	}
 
 	$po = restore_purchase_order_from_data($draft_data);
+	if ($po === false)
+		return false;
 	$po->trans_type = ST_SUPPINVOICE;
 
-	$order_no = add_direct_supp_trans($po);
+	$order_no = add_direct_supp_trans($po, true);
 
 	return $order_no ? $order_no : false;
+}
+
+/** Validate new direct-invoice financial intent through the existing core action boundary. */
+function validate_direct_supplier_financial_action($action, $data, $draft, $actor, $comments) {
+	if (!is_array($data)) return false;
+	if (!array_key_exists('direct_finance_binding', $data)
+		&& (isset($data['grn_items']) || isset($data['gl_codes']) || !array_key_exists('line_items', $data)))
+		return true;
+	if (!isset($_SESSION['wa_current_user'], $actor['user_id'], $actor['role_id'])
+		|| (int)$actor['user_id'] !== (int)$_SESSION['wa_current_user']->user
+		|| (int)$actor['role_id'] !== (int)$_SESSION['wa_current_user']->access)
+		return false;
+	if (in_array($action, array('reject','cancel'), true)) return true;
+	if (!array_key_exists('direct_finance_binding', $data)) return true;
+	if (!isset($_SESSION['wa_current_user']) || !$_SESSION['wa_current_user']->can_access('SA_SUPPLIERINVOICE')
+		|| isset($data['grn_items']) || isset($data['gl_codes']) || !is_array($data['direct_finance_binding']))
+		return false;
+	global $path_to_root;
+	include_once($path_to_root.'/purchasing/includes/db/direct_purchase_integrity_db.inc');
+	try {
+		$cart = restore_purchase_order_from_data($data);
+		if ($cart === false) return false;
+		$binding = direct_purchase_financial_binding($cart, $data['direct_finance_binding']);
+		return !isset($draft['amount']) || round2($draft['amount'] - $binding['amount'], $binding['precision']) == 0;
+	} catch (Exception $exception) { return false; }
 }
 
 /**
@@ -286,14 +389,10 @@ function execute_approved_supplier_invoice($draft_data, $reserved_trans_no, $dra
  */
 function execute_approved_purchase_requisition($draft_data, $reserved_trans_no, $draft_id)
 {
-	global $path_to_root;
-	include_once($path_to_root . '/purchasing/includes/db/purch_requisition_db.inc');
-
-	$requisition_id = isset($draft_data['requisition_id']) ? (int)$draft_data['requisition_id'] : 0;
-	if ($requisition_id <= 0)
-		return false;
-
-	return approve_requisition($requisition_id, 0) ? $requisition_id : false;
+    include_once($GLOBALS['path_to_root'].'/purchasing/includes/db/purch_requisition_approve_db.inc');
+    if (!is_array($draft_data) || !isset($draft_data['requisition_id'])) return false;
+    return approve_purch_requisition_from_core($draft_data['requisition_id'], 0, $draft_id, $draft_data)
+        ? (int)$draft_data['requisition_id'] : false;
 }
 
 /**
@@ -307,13 +406,9 @@ function execute_approved_purchase_requisition($draft_data, $reserved_trans_no, 
 function execute_approved_purchase_agreement($draft_data, $reserved_trans_no, $draft_id)
 {
 	global $path_to_root;
-	include_once($path_to_root . '/purchasing/includes/db/purch_agreement_db.inc');
+	require_once $path_to_root.'/purchasing/includes/db/purch_agreement_db.inc';
+	return execute_purchase_agreement_core_action('approve',$draft_data,$draft_id);
 
-	$agreement_id = isset($draft_data['agreement_id']) ? (int)$draft_data['agreement_id'] : 0;
-	if ($agreement_id <= 0)
-		return false;
-
-	return confirm_agreement($agreement_id) ? $agreement_id : false;
 }
 
 /**
@@ -393,14 +488,9 @@ function execute_approved_vendor_evaluation($draft_data, $reserved_trans_no, $dr
  */
 function reject_purchase_requisition_draft($draft_data, $draft_id, $comments)
 {
-	global $path_to_root;
-	include_once($path_to_root . '/purchasing/includes/db/purch_requisition_db.inc');
-
-	$requisition_id = isset($draft_data['requisition_id']) ? (int)$draft_data['requisition_id'] : 0;
-	if ($requisition_id <= 0)
-		return false;
-
-	return reject_requisition($requisition_id, 0, $comments);
+    include_once($GLOBALS['path_to_root'].'/purchasing/includes/db/purch_requisition_reject_db.inc');
+    if (!is_array($draft_data) || !isset($draft_data['requisition_id'])) return false;
+    return reject_purch_requisition_from_core($draft_data['requisition_id'], 0, $comments, $draft_id, $draft_data);
 }
 
 /**
@@ -413,14 +503,7 @@ function reject_purchase_requisition_draft($draft_data, $draft_id, $comments)
  */
 function cancel_purchase_requisition_draft($draft_data, $draft_id, $comments)
 {
-	global $path_to_root;
-	include_once($path_to_root . '/purchasing/includes/db/purch_requisition_db.inc');
-
-	$requisition_id = isset($draft_data['requisition_id']) ? (int)$draft_data['requisition_id'] : 0;
-	if ($requisition_id <= 0)
-		return false;
-
-	return reopen_purch_requisition($requisition_id);
+	return cancel_purchase_requisition_reopen($draft_data, $draft_id, $comments);
 }
 
 /**
@@ -434,26 +517,9 @@ function cancel_purchase_requisition_draft($draft_data, $draft_id, $comments)
 function reject_purchase_agreement_draft($draft_data, $draft_id, $comments)
 {
 	global $path_to_root;
-	include_once($path_to_root . '/purchasing/includes/db/purch_agreement_db.inc');
+	require_once $path_to_root.'/purchasing/includes/db/purch_agreement_db.inc';
+	return execute_purchase_agreement_core_action('reject',$draft_data,$draft_id,$comments);
 
-	$agreement_id = isset($draft_data['agreement_id']) ? (int)$draft_data['agreement_id'] : 0;
-	if ($agreement_id <= 0)
-		return false;
-
-	$agreement = get_purch_agreement($agreement_id);
-	if (!$agreement)
-		return false;
-
-	$custom_data = decode_purch_agreement_custom_data($agreement['custom_data']);
-	$custom_data['approval_rejection_reason'] = $comments;
-	$custom_data['approval_rejected_draft_id'] = (int)$draft_id;
-
-	$sql = "UPDATE " . TB_PREF . "purch_agreements SET
-		custom_data = " . sql_purch_agreement_custom_data($custom_data) . "
-		WHERE id = " . (int)$agreement_id;
-	db_query($sql, 'could not record purchase agreement rejection metadata');
-
-	return true;
 }
 
 /**
@@ -467,26 +533,9 @@ function reject_purchase_agreement_draft($draft_data, $draft_id, $comments)
 function cancel_purchase_agreement_draft($draft_data, $draft_id, $comments)
 {
 	global $path_to_root;
-	include_once($path_to_root . '/purchasing/includes/db/purch_agreement_db.inc');
+	require_once $path_to_root.'/purchasing/includes/db/purch_agreement_db.inc';
+	return execute_purchase_agreement_core_action('cancel',$draft_data,$draft_id,$comments);
 
-	$agreement_id = isset($draft_data['agreement_id']) ? (int)$draft_data['agreement_id'] : 0;
-	if ($agreement_id <= 0)
-		return false;
-
-	$agreement = get_purch_agreement($agreement_id);
-	if (!$agreement)
-		return false;
-
-	$custom_data = decode_purch_agreement_custom_data($agreement['custom_data']);
-	$custom_data['approval_cancel_reason'] = $comments;
-	$custom_data['approval_cancelled_draft_id'] = (int)$draft_id;
-
-	$sql = "UPDATE " . TB_PREF . "purch_agreements SET
-		custom_data = " . sql_purch_agreement_custom_data($custom_data) . "
-		WHERE id = " . (int)$agreement_id;
-	db_query($sql, 'could not record purchase agreement cancellation metadata');
-
-	return true;
 }
 
 /**
@@ -593,6 +642,11 @@ function cancel_vendor_evaluation_draft($draft_data, $draft_id, $comments)
  */
 function get_purchase_draft_amount($draft_data)
 {
+	if (isset($draft_data['approval_gross_amount']) && is_numeric($draft_data['approval_gross_amount']))
+		return (float)$draft_data['approval_gross_amount'];
+	if (isset($draft_data['direct_finance_binding']['amount'])
+		&& is_numeric($draft_data['direct_finance_binding']['amount']))
+		return (float)$draft_data['direct_finance_binding']['amount'];
 	$total = 0;
 	if (!empty($draft_data['line_items'])) {
 		foreach ($draft_data['line_items'] as $line) {
@@ -697,6 +751,27 @@ function get_vendor_evaluation_draft_amount($draft_data)
 function render_purchase_draft($draft_data)
 {
 	$html = '<table class="tablestyle" width="100%">';
+	if (isset($draft_data['plan_conversion']['plan_id'])) {
+		$html .= '<tr><th>'._('Immutable Procurement Plan').'</th><td colspan="3">'
+			.htmlspecialchars((string)$draft_data['plan_conversion']['plan_id']).'</td></tr>';
+	}
+	if (isset($draft_data['requisition_conversion']['requisition_id'])) {
+		$html .= '<tr><th>'._('Immutable Purchase Requisition').'</th><td colspan="3">'
+			.htmlspecialchars((string)$draft_data['requisition_conversion']['requisition_id']).'</td></tr>';
+	}
+	if (isset($draft_data['rfq_conversion']['rfq_id'])) {
+		$html .= '<tr><th>'._('RFQ source').'</th><td>'
+			.htmlspecialchars((string)$draft_data['rfq_conversion']['rfq_id']).'</td></tr>';
+		$html .= '<tr><th>'._('Awarded vendor').'</th><td>'
+			.htmlspecialchars((string)$draft_data['rfq_conversion']['vendor_id']).'</td></tr>';
+	}
+	if (isset($draft_data['agreement_conversion']['agreement_id'])) {
+		$html .= '<tr><th>'._('Purchase Agreement').'</th><td>'
+			.htmlspecialchars((string)$draft_data['agreement_conversion']['agreement_id']).'</td>'
+			.'<th>'._('Financial Tracking IDs').'</th><td>'
+			.htmlspecialchars((string)$draft_data['dimension']).' / '.htmlspecialchars((string)$draft_data['dimension2']).'</td></tr>';
+	}
+
 	$html .= '<tr><th>' . _('Supplier') . '</th><td>' . htmlspecialchars(isset($draft_data['supplier_name']) ? $draft_data['supplier_name'] : $draft_data['supplier_id']) . '</td>';
 	$html .= '<th>' . _('Reference') . '</th><td>' . htmlspecialchars(isset($draft_data['reference']) ? $draft_data['reference'] : '') . '</td></tr>';
 	$html .= '<tr><th>' . _('Date') . '</th><td>' . htmlspecialchars(isset($draft_data['orig_order_date']) ? $draft_data['orig_order_date'] : '') . '</td>';
@@ -795,15 +870,30 @@ function render_purchase_requisition_draft($draft_data)
  */
 function render_purchase_agreement_draft($draft_data)
 {
+	$classification = array(); $opaque = false;
+	foreach (array('dimension_id'=>1,'dimension2_id'=>2) as $field=>$axis)
+		if (!empty($draft_data[$field])) $classification[$axis.':'.(int)$draft_data[$field]] = sprintf(_('Dimension %d: #%d'),$axis,(int)$draft_data[$field]);
+	$payloads = array(isset($draft_data['custom_data']) ? $draft_data['custom_data'] : null);
+	foreach (isset($draft_data['line_items']) ? $draft_data['line_items'] : array() as $line)
+		$payloads[] = isset($line['custom_data']) ? $line['custom_data'] : null;
+	foreach ($payloads as $payload) {
+		$references = dimension_master_payload_references(is_array($payload) ? json_encode($payload) : $payload);
+		if ($references === false) { $opaque = true; continue; }
+		foreach ($references as $reference) $classification[$reference[1].':'.$reference[0]] = sprintf(_('Dimension %d: #%d'),$reference[1],$reference[0]);
+	}
 	$html = '<table class="tablestyle" width="100%">';
 	$html .= '<tr><th>' . _('Reference') . '</th><td>' . htmlspecialchars(isset($draft_data['reference']) ? $draft_data['reference'] : '') . '</td>';
-	$html .= '<th>' . _('Supplier') . '</th><td>' . htmlspecialchars(isset($draft_data['supplier_name']) ? $draft_data['supplier_name'] : '') . '</td></tr>';
+	$html .= '<th>' . _('Supplier') . '</th><td>' . htmlspecialchars(isset($draft_data['supplier_name']) ? $draft_data['supplier_name'] : (isset($draft_data['supplier_id']) ? '#'.$draft_data['supplier_id'] : '')) . '</td></tr>';
 	$html .= '<tr><th>' . _('Agreement Type') . '</th><td>' . htmlspecialchars(isset($draft_data['agreement_type']) ? $draft_data['agreement_type'] : '') . '</td>';
-	$html .= '<th>' . _('Buyer') . '</th><td>' . htmlspecialchars(isset($draft_data['buyer_name']) ? $draft_data['buyer_name'] : '') . '</td></tr>';
+	$html .= '<th>' . _('Buyer') . '</th><td>' . htmlspecialchars(isset($draft_data['buyer_name']) ? $draft_data['buyer_name'] : (isset($draft_data['buyer_id']) ? '#'.$draft_data['buyer_id'] : '')) . '</td></tr>';
 	$html .= '<tr><th>' . _('Start Date') . '</th><td>' . htmlspecialchars(isset($draft_data['date_start']) ? $draft_data['date_start'] : '') . '</td>';
 	$html .= '<th>' . _('End Date') . '</th><td>' . htmlspecialchars(isset($draft_data['date_end']) ? $draft_data['date_end'] : '') . '</td></tr>';
-	$html .= '<tr><th>' . _('Delivery Location') . '</th><td>' . htmlspecialchars(isset($draft_data['delivery_location_name']) ? $draft_data['delivery_location_name'] : '') . '</td>';
+	$html .= '<tr><th>' . _('Delivery Location') . '</th><td>' . htmlspecialchars(isset($draft_data['delivery_location_name']) ? $draft_data['delivery_location_name'] : (isset($draft_data['delivery_location']) ? $draft_data['delivery_location'] : '')) . '</td>';
 	$html .= '<th>' . _('Committed Total') . '</th><td><b>' . number_format(get_purchase_agreement_draft_amount($draft_data), 2) . '</b></td></tr>';
+	$html .= '<tr><th>'._('Classifications').'</th><td colspan="3">'.htmlspecialchars(implode(', ',$classification))
+		.($opaque ? ' '.htmlspecialchars(_('Additional retained classification requires owner review.')) : '').'</td></tr>';
+	if (!empty($draft_data['terms_and_conditions']))
+		$html .= '<tr><th>'._('Terms and Conditions').'</th><td colspan="3">'.htmlspecialchars($draft_data['terms_and_conditions']).'</td></tr>';
 
 	if (!empty($draft_data['notes']))
 		$html .= '<tr><th>' . _('Notes') . '</th><td colspan="3">' . htmlspecialchars($draft_data['notes']) . '</td></tr>';

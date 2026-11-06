@@ -98,10 +98,23 @@ function get_approval_workflow($workflow_id)
  * Get a workflow definition by transaction type
  *
  * @param int $trans_type Transaction type constant (ST_*)
+ * @param bool $lock_policy Lock current policy rows in the caller transaction
  * @return array|false    Workflow row or false
  */
-function get_approval_workflow_by_type($trans_type)
+function get_approval_workflow_by_type($trans_type, $lock_policy = false)
 {
+	if ($lock_policy) {
+		// Lock inactive rows too: activation must serialize with direct posting.
+		$result = db_query('SELECT * FROM '.TB_PREF.'approval_workflows WHERE trans_type='
+			.db_escape($trans_type).' ORDER BY id FOR UPDATE', 'could not lock approval policy');
+		if (!$result)
+			throw new RuntimeException('Approval policy could not be verified.');
+		$active = false;
+		while ($row = db_fetch($result))
+			if ($active === false && $row['is_active'])
+				$active = $row;
+		return $active;
+	}
 	$sql = "SELECT * FROM " . TB_PREF . "approval_workflows
 		WHERE trans_type = " . db_escape($trans_type) . "
 		AND is_active = 1";
@@ -246,10 +259,13 @@ function update_approval_level($level_id, $role_id, $min_approvers = 1,
  *
  * @param int  $workflow_id  Workflow ID
  * @param bool $active_only  Only return active levels
+ * @param bool $lock_policy Current locking read inside the owning transaction
  * @return resource           DB result set
  */
-function get_approval_levels($workflow_id, $active_only = true)
+function get_approval_levels($workflow_id, $active_only = true, $lock_policy = false)
 {
+	if ($lock_policy && empty($GLOBALS['transaction_level']))
+		throw new RuntimeException('Current approval levels require an owning transaction.');
 	$sql = "SELECT al.*, sr.role AS role_name
 		FROM " . TB_PREF . "approval_levels al
 		LEFT JOIN " . TB_PREF . "security_roles sr ON sr.id = al.role_id
@@ -259,6 +275,7 @@ function get_approval_levels($workflow_id, $active_only = true)
 		$sql .= " AND al.is_active = 1";
 
 	$sql .= " ORDER BY al.level ASC";
+	if ($lock_policy) $sql .= ' FOR UPDATE';
 
 	return db_query($sql, 'could not retrieve approval levels');
 }
@@ -371,10 +388,13 @@ function get_user_approval_level_for_workflow($workflow_id, $role_id)
  * @param int    $workflow_id Workflow ID
  * @param int    $level       Level number
  * @param string $loc_code    Optional location filter
+ * @param bool $lock_policy Current locking read within the owning submission
  * @return array              Array of role IDs
  */
-function get_approver_roles_at_level($workflow_id, $level, $loc_code = null)
+function get_approver_roles_at_level($workflow_id, $level, $loc_code = null, $lock_policy = false)
 {
+	if ($lock_policy && empty($GLOBALS['transaction_level']))
+		throw new RuntimeException('Current approval roles require an owning transaction.');
 	$sql = "SELECT DISTINCT role_id FROM " . TB_PREF . "approval_levels
 		WHERE workflow_id = " . db_escape($workflow_id) . "
 		AND level = " . db_escape($level) . "
@@ -383,6 +403,7 @@ function get_approver_roles_at_level($workflow_id, $level, $loc_code = null)
 	if ($loc_code !== null)
 		$sql .= " AND (loc_code IS NULL OR loc_code = " . db_escape($loc_code) . ")";
 
+	if ($lock_policy) $sql .= ' ORDER BY role_id FOR UPDATE';
 	$result = db_query($sql, 'could not get approver roles at level');
 
 	$roles = array();
@@ -425,10 +446,23 @@ function delete_all_approval_levels($workflow_id)
  * Check if a workflow has any active levels configured
  *
  * @param int $workflow_id Workflow ID
+ * @param bool $lock_policy Lock current level rows in the caller transaction
  * @return bool            True if at least one active level exists
  */
-function workflow_has_active_levels($workflow_id)
+function workflow_has_active_levels($workflow_id, $lock_policy = false)
 {
+	if ($lock_policy) {
+		// Read current committed rows, including disabled levels and empty ranges.
+		$result = db_query('SELECT id,is_active FROM '.TB_PREF.'approval_levels WHERE workflow_id='
+			.db_escape($workflow_id).' ORDER BY id FOR UPDATE', 'could not lock approval levels');
+		if (!$result)
+			throw new RuntimeException('Approval levels could not be verified.');
+		$active = false;
+		while ($row = db_fetch($result))
+			if ($row['is_active'])
+				$active = true;
+		return $active;
+	}
 	$sql = "SELECT COUNT(*) AS cnt FROM " . TB_PREF . "approval_levels
 		WHERE workflow_id = " . db_escape($workflow_id) . "
 		AND is_active = 1";

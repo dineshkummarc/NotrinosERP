@@ -93,6 +93,7 @@ function combo_input($name, $selected_id, $sql, $valfield, $namefield, $options=
 	}
 
 	$disabled = $opts['disabled'] ? 'disabled' : '';
+	if (isset($opts['employee_selector_token'])) $disabled .= ' data-employee-fallback';
 	$multi = $opts['multi'];
 	
 	if(!count($opts['search']))
@@ -135,7 +136,7 @@ function combo_input($name, $selected_id, $sql, $valfield, $namefield, $options=
 		$rel = "rel='$search_box'"; // set relation to list
 		if ($opts['search_submit']) {
 			if (isset($_POST[$search_button])) {
-				$selected_id = array(); // ignore selected_id while search
+				if (empty($opts['employee_selector_preserve_selection'])) $selected_id = array();
 				if (!$opts['async'])
 					$Ajax->activate('_page_body');
 				else
@@ -175,9 +176,27 @@ function combo_input($name, $selected_id, $sql, $valfield, $namefield, $options=
 	if (($type === 'customer' || $type === 'supplier') && !empty($SysPrefs->prefs['shortname_name_in_list']))
 		$pname = true;
 
-	if($result = db_query($sql)) {
-		while ($contact_row = db_fetch($result)) {
+	if($result = isset($opts['employee_selector_rows']) ? true : db_query($sql)) {
+		$employee_batch_rows = isset($opts['employee_selector_rows']) ? $opts['employee_selector_rows'] : null;
+		if (isset($opts['employee_name_batch'])) {
+			if ($employee_batch_rows === null) {
+				$employee_batch_rows = array();
+				while ($contact_row = db_fetch($result))
+					$employee_batch_rows[] = $contact_row;
+			}
+			hrm_person_worker_prepare_employee_name_batch($employee_batch_rows,
+				$selected_id, $opts, isset($_POST[$search_button]));
+		}
+		$employee_batch_index = 0;
+		while ($employee_batch_rows !== null
+			? isset($employee_batch_rows[$employee_batch_index]) && ($contact_row = $employee_batch_rows[$employee_batch_index++])
+			: ($contact_row = db_fetch($result))) {
 			$value = $contact_row[0];
+			// Opted-in employee controls only: keep search-selected inactive rows.
+			if ($employee_batch_rows !== null && !isset($_POST[$search_button])
+				&& !$opts['show_inactive'] && !empty($contact_row['inactive'])
+				&& !in_array((string)$value, $selected_id, true))
+				continue;
 			$descr = $opts['format']==null ?  $contact_row[1] : call_user_func($opts['format'], $contact_row, $pname);
 			$data_descr = $opts['data_format'] !== null
 				? call_user_func($opts['data_format'], $contact_row, true)
@@ -188,7 +207,7 @@ function combo_input($name, $selected_id, $sql, $valfield, $namefield, $options=
 			$value_attr = htmlspecialchars((string)$value, ENT_QUOTES, 'UTF-8');
 			$descr_text = htmlspecialchars((string)$descr, ENT_QUOTES, 'UTF-8');
 			$sel = '';
-			if (isset($_POST[$search_button]) && $txt_match !== ''
+            if (!isset($opts['employee_selector_token']) && isset($_POST[$search_button]) && $txt_match !== ''
 				&& ($txt_match === $value_text
 					|| $txt_match === $descr_text_raw
 					|| $txt_match === $data_descr_raw))
@@ -225,7 +244,7 @@ function combo_input($name, $selected_id, $sql, $valfield, $namefield, $options=
 		}
 		if ($lastcat!==null)
 			$selector .= '</optgroup>';
-		db_free_result($result);
+		if ($result !== true) db_free_result($result);
 	}
 
 	// Prepend special option.
@@ -241,16 +260,23 @@ function combo_input($name, $selected_id, $sql, $valfield, $namefield, $options=
 		$selected_id = array($first_id);
 	
 	$_POST[$name] = $multi ? $selected_id : $selected_id[0];
+	$employee_search_attrs = isset($opts['employee_selector_token'])
+		? " data-employee-search='".htmlspecialchars($opts['employee_selector_token'], ENT_QUOTES, 'UTF-8')
+		."' data-employee-url='".htmlspecialchars($opts['employee_selector_url'], ENT_QUOTES, 'UTF-8')."'" : '';
+
+	if (isset($opts['employee_selector_snapshot']))
+		$employee_search_attrs .= " data-employee-snapshot='"
+			.htmlspecialchars(json_encode($opts['employee_selector_snapshot']), ENT_QUOTES, 'UTF-8')."'";
 
 	if ($SysPrefs->use_popup_search)
 		$selector = "<select id='".htmlspecialchars($name, ENT_QUOTES, 'UTF-8')."' autocomplete='off' ".($multi ? 'multiple' : '')
 		. ($opts['height']!==false ? ' size="'.$opts['height'].'"' : '')
-		. "$disabled name='".htmlspecialchars($name.($multi ? '[]':''), ENT_QUOTES, 'UTF-8')."' class='$class' title='"
+		. "$disabled $employee_search_attrs name='".htmlspecialchars($name.($multi ? '[]':''), ENT_QUOTES, 'UTF-8')."' class='$class' title='"
 		. htmlspecialchars((string)$opts['sel_hint'], ENT_QUOTES, 'UTF-8')."' $rel>".$selector."</select>\n";
 	else
 		$selector = "<select autocomplete='off' ".($multi ? "multiple" : '')
 		. ($opts['height']!==false ? ' size="'.$opts['height'].'"' : '')
-		. "$disabled name='".htmlspecialchars($name.($multi ? '[]':''), ENT_QUOTES, 'UTF-8')."' class='$class' title='"
+		. "$disabled $employee_search_attrs name='".htmlspecialchars($name.($multi ? '[]':''), ENT_QUOTES, 'UTF-8')."' class='$class' title='"
 		. htmlspecialchars((string)$opts['sel_hint'], ENT_QUOTES, 'UTF-8')."' $rel>".$selector."</select>\n";
 	if ($by_id && ($search_box != false || $opts['editable']) ) {
 		// on first display show selector list
@@ -265,6 +291,7 @@ function combo_input($name, $selected_id, $sql, $valfield, $namefield, $options=
 			set_focus($name); // prevent lost focus
 		if (!$opts['editable'])
 			$txt = $found;
+        if (isset($opts['employee_selector_term'])) $txt = $opts['employee_selector_term'];
 		$datalist = "<datalist id='".htmlspecialchars($datalist_id, ENT_QUOTES, 'UTF-8')."'>".$data_options."</datalist>";
 		$Ajax->addUpdate($name, $search_box, $txt ? $txt : '');
 	}
@@ -275,7 +302,7 @@ function combo_input($name, $selected_id, $sql, $valfield, $namefield, $options=
 	$selector = "<span id='_{$name}_sel'>".$selector."</span>\n";
 
 	// if selectable or editable list is used - add select button
-	if ($select_submit != false || $search_button) {
+	if ($select_submit != false || ($search_button && !isset($opts['employee_selector_token']))) {
 	// button class selects form reload/ajax selector update
 		$selector .= sprintf(SELECT_BUTTON, $disabled, user_theme(),
 			(fallback_mode() ? '' : 'display:none;'),
@@ -299,7 +326,7 @@ function combo_input($name, $selected_id, $sql, $valfield, $namefield, $options=
 		if(!empty($datalist))
 			$edit_entry .= $datalist;
 	}
-	default_focus(($search_box && $by_id) ? $search_box : $name);
+	default_focus(isset($opts['employee_selector_token']) ? $name : (($search_box && $by_id) ? $search_box : $name));
 
 	$search_btn = '';
 	if ($SysPrefs->use_popup_search && (!isset($opts['fixed_asset']) || !$opts['fixed_asset'])) {
@@ -853,8 +880,15 @@ function months_list_cells($label, $name, $selected_id=null, $submit_on_change=f
 
 //------------------------------------------------------------------------------------
 
-function dimensions_list($name, $selected_id=null, $no_option=false, $showname=' ', $submit_on_change=false, $showclosed=false, $showtype=1) {
+function dimensions_list($name, $selected_id=null, $no_option=false, $showname=' ', $submit_on_change=false, $showclosed=false, $showtype=1, $retained_id=0) {
 	$sql = "SELECT id, CONCAT(reference,'  ',name) as ref FROM ".TB_PREF."dimensions";
+	// A source owner may expose its persisted coordinate without replacing a
+	// closed/orphan value with the blank option. This grants no write authority.
+	$retained_id = is_numeric($retained_id) && (int)$retained_id > 0 ? (int)$retained_id : 0;
+	if ($retained_id) {
+		$sql = "SELECT id, CONCAT(reference,'  ',name) as ref FROM (SELECT id,reference,name,type_,closed FROM ".TB_PREF."dimensions"
+			." UNION ALL SELECT ".$retained_id.",'',".db_escape(_('Retained Dimension').' #'.$retained_id).",0,1 WHERE NOT EXISTS (SELECT 1 FROM ".TB_PREF."dimensions WHERE id=".$retained_id.")) retained_dimensions WHERE 1=1";
+	}
 
 	$options = array(
 		'order' => 'reference',
@@ -865,30 +899,30 @@ function dimensions_list($name, $selected_id=null, $no_option=false, $showname='
 	);
 
 	if (!$showclosed)
-		$options['where'][] = "closed=0";
+		$options['where'][] = "(closed=0".($retained_id ? ' OR id='.$retained_id : '').")";
 	if($showtype)
-		$options['where'][] = "type_=".db_escape($showtype);
+		$options['where'][] = "(type_=".db_escape($showtype).($retained_id ? ' OR id='.$retained_id : '').")";
 
 	return combo_input($name, $selected_id, $sql, 'id', 'ref', $options);
 }
 
-function dimensions_list_cells($label, $name, $selected_id=null, $no_option=false, $showname=null, $showclosed=false, $showtype=0, $submit_on_change=false) {
+function dimensions_list_cells($label, $name, $selected_id=null, $no_option=false, $showname=null, $showclosed=false, $showtype=0, $submit_on_change=false, $retained_id=0) {
 	filter_cell_open($label);
-	echo dimensions_list($name, $selected_id, $no_option, $showname, $submit_on_change, $showclosed, $showtype);
+	echo dimensions_list($name, $selected_id, $no_option, $showname, $submit_on_change, $showclosed, $showtype, $retained_id);
 	filter_cell_close();
 }
 
-function dimensions_list_row($label, $name, $selected_id=null, $no_option=false, $showname=null, $showclosed=false, $showtype=0, $submit_on_change=false) {
+function dimensions_list_row($label, $name, $selected_id=null, $no_option=false, $showname=null, $showclosed=false, $showtype=0, $submit_on_change=false, $retained_id=0) {
 	if (ui_current_table_mode() != 'table') {
 		echo "<div class='form-group'>";
 		echo "<label class='form-label'>".$label."</label>";
 		echo "<div class='form-control-wrap'>";
-		echo dimensions_list($name, $selected_id, $no_option, $showname, $submit_on_change, $showclosed, $showtype);
+		echo dimensions_list($name, $selected_id, $no_option, $showname, $submit_on_change, $showclosed, $showtype, $retained_id);
 		echo "</div></div>\n";
 		return;
 	}
 	echo "<tr><td class='label'>".$label."</td>";
-	dimensions_list_cells(null, $name, $selected_id, $no_option, $showname, $showclosed, $showtype, $submit_on_change);
+	dimensions_list_cells(null, $name, $selected_id, $no_option, $showname, $showclosed, $showtype, $submit_on_change, $retained_id);
 	echo "</tr>\n";
 }
 
@@ -2634,12 +2668,13 @@ function employees_list($name, $selected_id=null, $all_option=false, $submit_on_
 	global $path_to_root;
 	include_once($path_to_root.'/hrm/includes/db/employee_projection_control_db.inc');
 	hrm_employee_projection_require_readable();
+	include_once($path_to_root.'/hrm/includes/ui/employee_selector_search.inc');
 	$sql = "SELECT employee_id, CONCAT(first_name, ' ', last_name) name, d.department_name, e.inactive FROM ".TB_PREF."employees e LEFT JOIN ".TB_PREF."departments d ON e.department_id = d.department_id";
 
 	if ($editkey)
 		set_editor('employee', $name, $editkey);
 
-	return combo_input($name, $selected_id, $sql, 'employee_id', 'name',
+	return hrm_employee_selector_control($name, $selected_id, $sql,
 		array_merge(
 		  array(
 			'format' => '_format_employee_list',

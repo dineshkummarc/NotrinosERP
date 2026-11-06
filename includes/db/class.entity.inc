@@ -1,4 +1,5 @@
 <?php
+include_once(__DIR__.'/json_sql.inc');
 /**********************************************************************
 	Copyright (C) NotrinosERP.
 	Released under the terms of the GNU General Public License, GPL, 
@@ -633,6 +634,176 @@ class Entity extends record_set {
 	}
 
 	/**
+	 * Route registered ordinary models through their native reference fence.
+	 * Table identity, rather than subclass identity or declared fields, owns this
+	 * boundary. Unrelated models retain their existing persistence behavior.
+	 */
+	protected function ordinary_dimension_write($operation, $key, $data) {
+		if (preg_match('/^\s*`?(?:bom|purch_data)\b/i',$this->name)) {
+			if (!in_array($this->name,array('bom','purch_data'),true) || !is_array($data) || !is_array($this->key)
+				|| ($this->subset!==null && $this->subset!==false && $this->subset!=='')) return false;
+			require_once __DIR__.'/../../dimensions/includes/dimension_composite_metadata_writer.inc';
+			$columns=dimension_composite_metadata_columns($this->name);$declared=$this->key;sort($columns);sort($declared);
+			if ($columns!==$declared) return false;
+			$identity=dimension_composite_metadata_key($this->name,$operation==='insert'?$data:$key);
+			if ($identity===false) return false;
+			foreach ($data as $field=>$value) {
+				$canonical=strtolower((string)$field);
+				if ($field!==$canonical && in_array($canonical,array_merge($columns,array('id','custom_data')),true) && in_array($field,$this->fields)) return false;
+				if ($operation!=='insert' && in_array($field,$columns,true) && in_array($field,$this->fields)) {
+					$proposed=dimension_composite_metadata_key($this->name,array($field=>$value)+$identity);
+					if ($proposed!==$identity) return false;
+				}
+			}
+			$next=array_intersect_key($data,array_flip($this->fields));
+			if ($operation==='insert') $next=$identity+$next;
+			return dimension_composite_metadata_write($this->name,$operation==='insert'?null:$identity,$next,
+				function($admitted)use($operation,$identity,$data){return $this->ordinary_dimension_persist($operation,$identity,$admitted+$data);},$operation==='delete');
+		}
+		// Financial ledgers and provision logs require their native transaction writers, including imports.
+		if (preg_match('/^\s*`?(?:warranty_provision_log|gl_trans|bank_trans|debtor_trans|debtor_trans_details|supp_trans|supp_invoice_items|stock_moves|sales_orders|sales_order_details)\b/i', $this->name)) return false;
+		$keys = array('suppliers'=>'supplier_id', 'debtors_master'=>'debtor_no', 'quick_entry_lines'=>'id', 'stock_category'=>'category_id', 'stock_master'=>'stock_id', 'chart_master'=>'account_code', 'bank_accounts'=>'id', 'budget_trans'=>'id', 'purch_rfq'=>'id', 'purch_rfq_items'=>'id', 'purch_rfq_vendors'=>'id', 'purch_rfq_vendor_lines'=>'id');
+		$keys['areas']='area_code';$keys['tax_types']='id';$keys['chart_types']='id';$keys['chart_class']='cid';
+		$keys['vendor_pricelists']='id';$keys['item_codes']='id';$keys['sales_pos']='id';$keys['sales_types']='id';$keys['salesman']='salesman_code';$keys['prices']='id';
+		$keys['purch_requisitions'] = 'id';
+		$keys['purch_requisition_lines'] = 'id';
+		$keys['sales_agreements'] = 'id';
+		$keys['sales_agreement_lines'] = 'id';
+		$keys['purch_agreements'] = 'id';
+		$keys['purch_agreement_lines'] = 'id';
+		if (preg_match('/^\s*`?(?:purch_agreements|purch_agreement_lines|sales_agreements|sales_agreement_lines)\b/i', $this->name)
+			&& !isset($keys[strtolower(trim($this->name))])) return false;
+		$keys['wh_material_requests'] = 'request_id';
+		$keys['wh_material_request_lines'] = 'line_id';
+		$keys['wh_transfer_orders'] = 'transfer_id';
+		$keys['wh_transfer_order_lines'] = 'line_id';
+		if (preg_match('/^\s*`?(?:wh_material_requests|wh_material_request_lines|wh_transfer_orders|wh_transfer_order_lines)\b/i', $this->name)
+			&& !isset($keys[strtolower(trim($this->name))])) return false;
+		if (preg_match('/^\s*`(?:purch_requisitions|purch_requisition_lines)`/i', $this->name)) return false;
+		if(preg_match('/^\s*`?(?:areas|tax_types|chart_types|chart_class|sales_pos|sales_types|salesman|prices|item_codes|vendor_pricelists)\b/i',$this->name) && !isset($keys[$this->name]))return false;
+		$owner = strtolower(trim($this->name));
+		if (!isset($keys[$owner])) {
+			// SQL aliases/comments are not canonical owner identities.
+			if (preg_match('/^\s*(?:suppliers|debtors_master|quick_entry_lines|stock_category|stock_master|chart_master|bank_accounts|budget_trans|purch_rfq|purch_rfq_items|purch_rfq_vendors|purch_rfq_vendor_lines|purch_requisitions|purch_requisition_lines)\b/i', $this->name)) return false;
+			return $this->ordinary_dimension_persist($operation, $key, $data);
+		}
+		require_once __DIR__.'/../../dimensions/includes/dimension_reference_writer_fence.inc';
+		$primary = $keys[$owner];
+		if ($this->key !== $primary || !is_array($data)) return false;
+		$string_key = in_array($owner,array('stock_master','chart_master','chart_types','chart_class'),true);
+		$identity_reader = function($value)use($owner){return dimension_writer_master_id($owner,$value);};
+		if ($operation !== 'insert') {
+			$key = call_user_func($identity_reader, $key);
+			if ($key === false || (!$string_key && !$key)) return false;
+		}
+		if ($string_key && $operation === 'insert' && (!isset($data[$primary]) || call_user_func($identity_reader, $data[$primary]) === false)) return false;
+		if (array_key_exists($primary, $data)) {
+			$id = call_user_func($identity_reader, $data[$primary]);
+			if ($id === false || ($operation !== 'insert' && $id !== $key)) return false;
+			if ($string_key) $data[$primary] = $id;
+		}
+		// SQL column names are case-insensitive, but admission keys are exact.
+		// A generic model may declare aliases which native SQL would persist.
+		// Require canonical sensitive columns; undeclared input stays ignored.
+		foreach ($data as $field=>$value) {
+			$canonical = strtolower((string)$field);
+			if ($field !== $canonical && in_array($canonical, array($primary, 'dimension_id', 'dimension2_id', 'dflt_dim1', 'dflt_dim2', 'custom_data', 'rfq_id', 'rfq_vendor_id', 'rfq_item_id'), true)
+				&& in_array($field, $this->fields)) return false;
+		}
+		// Match native field filtering before interpreting any serialized payload.
+		$next = array_intersect_key($data, array_flip($this->fields));
+		if(in_array($owner,array('areas','tax_types','chart_types','chart_class','sales_pos','sales_types','salesman','prices','item_codes','vendor_pricelists'),true)){
+			require_once __DIR__.'/../../dimensions/includes/dimension_master_metadata_writer.inc';
+			if($this->subset!==null && $this->subset!==false && $this->subset!=='')return false;
+			return dimension_master_metadata_write($owner,$key,$next,function($admitted)use($operation,$key,$data){return $this->ordinary_dimension_persist($operation,$key,$admitted+$data);},$operation==='delete');
+		}
+		if ($owner === 'sales_agreements' || $owner === 'sales_agreement_lines') {
+			require_once __DIR__.'/../../sales/includes/db/sales_agreement_dimension_db.inc';
+			if ($this->subset !== null && $this->subset !== false && $this->subset !== '') return false;
+			return sales_agreement_dimension_entity_write($owner, $operation, $key, $next,
+				function() use ($operation, $key, $data) {
+					if ($operation === 'insert') return parent::insert_check($data);
+					if ($operation === 'update') return parent::update($key, $data);
+					return parent::delete_check($key);
+				});
+		}
+
+		if ($owner === 'purch_agreements' || $owner === 'purch_agreement_lines') {
+			require_once __DIR__.'/../../purchasing/includes/db/purch_agreement_dimension_db.inc';
+			if ($this->subset !== null && $this->subset !== false && $this->subset !== '') return false;
+			return purch_agreement_dimension_entity_write($owner, $operation, $key, $next,
+				function() use ($operation, $key, $data) {
+					if ($operation === 'insert') return parent::insert_check($data);
+					if ($operation === 'update') return parent::update($key, $data);
+					return parent::delete_check($key);
+				});
+		}
+		if ($owner === 'wh_transfer_orders' || $owner === 'wh_transfer_order_lines') {
+			require_once __DIR__.'/../../inventory/warehouse/includes/db/warehouse_transfer_entity_db.inc';
+			if ($this->subset !== null && $this->subset !== false && $this->subset !== '') return false;
+			return write_transfer_order_entity($owner, $operation, $key, $next,
+				function() use ($operation, $key, $data) {
+					if ($operation === 'insert') return parent::insert_check($data);
+					if ($operation === 'update') return parent::update($key, $data);
+					return parent::delete_check($key);
+				});
+		}
+		if ($owner === 'wh_material_requests' || $owner === 'wh_material_request_lines') {
+			require_once __DIR__.'/../../inventory/warehouse/includes/db/warehouse_material_entity_db.inc';
+			if ($this->subset) return false;
+			return write_material_request_entity($owner, $operation, $key, $next,
+				function() use ($operation, $key, $data) {
+					if ($operation === 'insert') return parent::insert_check($data);
+					if ($operation === 'update') return parent::update($key, $data);
+					return parent::delete_check($key);
+				});
+		}
+		if ($owner === 'purch_requisitions' || $owner === 'purch_requisition_lines') {
+			// Requisitions are paired commands, never independent Entity row SQL.
+			require_once __DIR__.'/../../purchasing/includes/db/purch_requisition_entity_db.inc';
+			if ($this->subset) return false;
+			return write_purch_requisition_entity($owner, $operation, $key, $next,
+				function() use ($operation, $key, $data) {
+					if ($operation === 'insert') return parent::insert_check($data);
+					if ($operation === 'update') return parent::update($key, $data);
+					return parent::delete_check($key);
+				});
+		}
+		if ($owner === 'purch_rfq_vendor_lines') {
+			return dimension_rfq_response_write($key, $next,
+				function($admitted) use ($operation, $key, $data) {
+					return $this->ordinary_dimension_persist($operation, $key, $admitted + $data);
+				}, $operation === 'delete');
+		}
+		if ($owner === 'purch_rfq_items' || $owner === 'purch_rfq_vendors') {
+			return dimension_rfq_child_write($owner, $key, $next,
+				function($admitted) use ($operation, $key, $data) {
+					return $this->ordinary_dimension_persist($operation, $key, $admitted + $data);
+				}, $operation === 'delete');
+		}
+		$defaults = $owner === 'stock_category' ? array('dflt_dim1'=>0, 'dflt_dim2'=>0) : array('dimension_id'=>0, 'dimension2_id'=>0);
+		if ($owner === 'chart_master' || $owner === 'bank_accounts') $defaults = array();
+		if ($operation === 'insert') $next += $defaults;
+		if ($operation === 'delete') $next = $defaults;
+        if($owner==='stock_master'){
+            require_once __DIR__.'/../../inventory/includes/db/item_dimension_maintenance_db.inc';
+            return item_dimension_stock_entity_write($operation,$key,$next,function($admitted)use($operation,$key,$data){return $this->ordinary_dimension_persist($operation,$key,$admitted+$data);},isset($data[$primary])?$data[$primary]:null);
+        }
+		return dimension_ordinary_master_write($owner, $key, $next,
+			function($admitted) use ($operation, $key, $data) {
+				// Preserve existing filtering/validation and explicit insert identities.
+				return $this->ordinary_dimension_persist($operation, $key, $admitted + $data);
+			}, $operation === 'update', $operation === 'delete');
+	}
+
+	/** Dispatch admitted writes without recursively entering the public boundary. */
+	private function ordinary_dimension_persist($operation, $key, $data) {
+		if ($operation === 'insert') return $this->insert_record($data);
+		if ($operation === 'update') return $this->update_record($key, $data);
+		return $this->delete_record($key);
+	}
+
+	/**
 	 * Update a record by primary key.
 	 *
 	 * Only fields listed in $this->fields are written to the database.
@@ -643,6 +814,11 @@ class Entity extends record_set {
 	 * @return bool True on success, false on validation failure or DB error
 	 */
 	function update($key, $data) {
+		return $this->ordinary_dimension_write('update', $key, $data);
+	}
+
+	/** Persist an admitted update using existing native validation and SQL. */
+	private function update_record($key, $data) {
 		if (!parent::update($key, $data))	// validate data
 			return false;
 
@@ -650,8 +826,14 @@ class Entity extends record_set {
 		$updates = array();
 
 		foreach($data as $fld => $value) {	// select only data relevant for this model
+			// Retain opaque owner-serialized data without display-string encoding.
+			if ($fld === 'custom_data' && in_array($fld, $this->fields)) {
+				$updates[$fld] = "`$fld`=".($value === null ? 'NULL' : "'".db_escape_function($value)."'");
+				continue;
+			}
 			if (in_array($fld, $this->fields))
-				$updates[$fld] = "`$fld`=".db_escape($value, $value === null);
+				$updates[$fld] = "`$fld`=".($fld === 'custom_data'
+					? db_escape_json($value, $value === null) : db_escape($value, $value === null));
 		}
 		if (count($updates) == 0)
 			return $this->error(_("Empty update data for table ").$this->name);
@@ -687,6 +869,11 @@ class Entity extends record_set {
 	 * @return bool True on success, false if deletion is not allowed or on DB error
 	 */
 	function delete($key) {
+		return $this->ordinary_dimension_write('delete', $key, array());
+	}
+
+	/** Persist an admitted delete using existing native validation and SQL. */
+	private function delete_record($key) {
 		if (!parent::delete_check($key))
 			return false;
 
@@ -721,14 +908,25 @@ class Entity extends record_set {
 	 * @return bool True on success, false on validation failure or DB error
 	 */
 	function insert($data) {
+		return $this->ordinary_dimension_write('insert', null, $data);
+	}
+
+	/** Persist an admitted insert using existing native validation and SQL. */
+	private function insert_record($data) {
 		if (!parent::insert_check($data))
 			return false;
 
 		$sql = "INSERT INTO ".TB_PREF.$this->name. ' (';
 		$fields = array();
 		foreach($data as $fld => $value) {
-			if (in_array($fld, $this->fields) || (is_array($this->key) ? in_array($this->key) : $fld==$this->key))
-				$fields["`$fld`"] = db_escape($value, $value === null);
+			// custom_data is already serialized by its owner; retain its exact bytes.
+			if ($fld === 'custom_data' && in_array($fld, $this->fields)) {
+				$fields["`$fld`"] = $value === null ? 'NULL' : "'".db_escape_function($value)."'";
+				continue;
+			}
+			if (in_array($fld, $this->fields) || (is_array($this->key) ? in_array($fld, $this->key, true) : $fld==$this->key))
+				$fields["`$fld`"] = $fld === 'custom_data'
+					? db_escape_json($value, $value === null) : db_escape($value, $value === null);
 		}
 		if (!count($fields))
 			return $this->error(_("Empty data set for insertion into ").$this->name);

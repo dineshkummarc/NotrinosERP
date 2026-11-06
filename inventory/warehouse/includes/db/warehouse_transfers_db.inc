@@ -14,7 +14,7 @@
  * Warehouse Transfer Orders — CRUD and lifecycle management.
  *
  * Transfer order lifecycle: Draft → Approved → Shipped → In Transit → Received → (Cancelled)
- * Supports partial receipt with automatic backorder creation.
+ * Partial receipts retain the outstanding dispatched quantity on this order.
  *
  * Tables: 0_wh_transfer_orders, 0_wh_transfer_order_lines
  *
@@ -102,29 +102,9 @@ function add_transfer_order($from_loc_code, $to_loc_code, $request_date,
 	$transfer_type = 'standard', $reference = null, $memo = null,
 	$expected_ship = null, $expected_recv = null)
 {
-	$transfer_no = get_next_transfer_order_no();
-
-	$sql = "INSERT INTO " . TB_PREF . "wh_transfer_orders (
-		transfer_no, transfer_type, status, from_loc_code, to_loc_code,
-		request_date, expected_ship_date, expected_recv_date,
-		requested_by, reference, memo, created_at
-	) VALUES ("
-		. (int)$transfer_no . ","
-		. db_escape($transfer_type) . ","
-		. "'draft',"
-		. db_escape($from_loc_code) . ","
-		. db_escape($to_loc_code) . ","
-		. db_escape($request_date) . ","
-		. ($expected_ship ? db_escape($expected_ship) : 'NULL') . ","
-		. ($expected_recv ? db_escape($expected_recv) : 'NULL') . ","
-		. (int)$_SESSION['wa_current_user']->user . ","
-		. ($reference ? db_escape($reference) : 'NULL') . ","
-		. ($memo ? db_escape($memo) : 'NULL') . ","
-		. "NOW()"
-		. ")";
-
-	db_query($sql, 'could not add transfer order');
-	return db_insert_id();
+    require_once __DIR__.'/warehouse_transfer_header_db.inc';
+    return write_native_transfer_header(null, $from_loc_code, $to_loc_code, $request_date,
+        $transfer_type, $reference, $memo, $expected_ship, $expected_recv);
 }
 
 /**
@@ -142,27 +122,12 @@ function add_transfer_order($from_loc_code, $to_loc_code, $request_date,
  * @return int Inserted line_id
  */
 function add_transfer_order_line($transfer_id, $stock_id, $qty,
-	$from_bin_id = null, $to_bin_id = null,
-	$batch_id = null, $serial_id = null,
-	$unit_cost = 0, $memo = null)
+    $from_bin_id = null, $to_bin_id = null, $batch_id = null, $serial_id = null, $unit_cost = 0, $memo = null)
 {
-	$sql = "INSERT INTO " . TB_PREF . "wh_transfer_order_lines (
-		transfer_id, stock_id, qty_requested, from_bin_id, to_bin_id,
-		batch_id, serial_id, unit_cost, memo
-	) VALUES ("
-		. (int)$transfer_id . ","
-		. db_escape($stock_id) . ","
-		. (float)$qty . ","
-		. ($from_bin_id ? (int)$from_bin_id : 'NULL') . ","
-		. ($to_bin_id ? (int)$to_bin_id : 'NULL') . ","
-		. ($batch_id ? (int)$batch_id : 'NULL') . ","
-		. ($serial_id ? (int)$serial_id : 'NULL') . ","
-		. (float)$unit_cost . ","
-		. ($memo ? db_escape($memo) : 'NULL')
-		. ")";
-
-	db_query($sql, 'could not add transfer order line');
-	return db_insert_id();
+    require_once __DIR__.'/warehouse_transfer_line_db.inc';
+    return write_native_transfer_line('add', $transfer_id, array('stock_id'=>$stock_id, 'qty_requested'=>$qty,
+        'from_bin_id'=>$from_bin_id, 'to_bin_id'=>$to_bin_id, 'batch_id'=>$batch_id, 'serial_id'=>$serial_id,
+        'unit_cost'=>$unit_cost, 'memo'=>$memo));
 }
 
 /**
@@ -182,19 +147,9 @@ function update_transfer_order($transfer_id, $from_loc_code, $to_loc_code,
 	$request_date, $transfer_type = 'standard', $reference = null, $memo = null,
 	$expected_ship = null, $expected_recv = null)
 {
-	$sql = "UPDATE " . TB_PREF . "wh_transfer_orders SET "
-		. "from_loc_code=" . db_escape($from_loc_code) . ","
-		. "to_loc_code=" . db_escape($to_loc_code) . ","
-		. "request_date=" . db_escape($request_date) . ","
-		. "transfer_type=" . db_escape($transfer_type) . ","
-		. "reference=" . ($reference ? db_escape($reference) : 'NULL') . ","
-		. "memo=" . ($memo ? db_escape($memo) : 'NULL') . ","
-		. "expected_ship_date=" . ($expected_ship ? db_escape($expected_ship) : 'NULL') . ","
-		. "expected_recv_date=" . ($expected_recv ? db_escape($expected_recv) : 'NULL') . ","
-		. "updated_at=NOW()"
-		. " WHERE transfer_id=" . (int)$transfer_id;
-
-	db_query($sql, 'could not update transfer order');
+    require_once __DIR__.'/warehouse_transfer_header_db.inc';
+    return write_native_transfer_header($transfer_id, $from_loc_code, $to_loc_code, $request_date,
+        $transfer_type, $reference, $memo, $expected_ship, $expected_recv);
 }
 
 /**
@@ -210,20 +165,12 @@ function update_transfer_order($transfer_id, $from_loc_code, $to_loc_code,
  * @param string|null $memo         Line memo
  */
 function update_transfer_order_line($line_id, $qty, $from_bin_id = null,
-	$to_bin_id = null, $batch_id = null, $serial_id = null,
-	$unit_cost = 0, $memo = null)
+    $to_bin_id = null, $batch_id = null, $serial_id = null, $unit_cost = 0, $memo = null, $expected_parent = null)
 {
-	$sql = "UPDATE " . TB_PREF . "wh_transfer_order_lines SET "
-		. "qty_requested=" . (float)$qty . ","
-		. "from_bin_id=" . ($from_bin_id ? (int)$from_bin_id : 'NULL') . ","
-		. "to_bin_id=" . ($to_bin_id ? (int)$to_bin_id : 'NULL') . ","
-		. "batch_id=" . ($batch_id ? (int)$batch_id : 'NULL') . ","
-		. "serial_id=" . ($serial_id ? (int)$serial_id : 'NULL') . ","
-		. "unit_cost=" . (float)$unit_cost . ","
-		. "memo=" . ($memo ? db_escape($memo) : 'NULL')
-		. " WHERE line_id=" . (int)$line_id;
-
-	db_query($sql, 'could not update transfer order line');
+    require_once __DIR__.'/warehouse_transfer_line_db.inc';
+    return write_native_transfer_line('update', $line_id, array('qty_requested'=>$qty,
+        'from_bin_id'=>$from_bin_id, 'to_bin_id'=>$to_bin_id, 'batch_id'=>$batch_id, 'serial_id'=>$serial_id,
+        'unit_cost'=>$unit_cost, 'memo'=>$memo), $expected_parent);
 }
 
 /**
@@ -231,9 +178,9 @@ function update_transfer_order_line($line_id, $qty, $from_bin_id = null,
  *
  * @param int $line_id Line ID
  */
-function delete_transfer_order_line($line_id) {
-	$sql = "DELETE FROM " . TB_PREF . "wh_transfer_order_lines WHERE line_id=" . (int)$line_id;
-	db_query($sql, 'could not delete transfer order line');
+function delete_transfer_order_line($line_id, $expected_parent = null) {
+    require_once __DIR__.'/warehouse_transfer_line_db.inc';
+    return write_native_transfer_line('delete', $line_id, array(), $expected_parent);
 }
 
 /**
@@ -406,18 +353,29 @@ function can_delete_transfer_order($transfer_id) {
  * @return bool Success
  */
 function delete_transfer_order($transfer_id) {
-	if (!can_delete_transfer_order($transfer_id))
-		return false;
-
-	begin_transaction();
-	$sql = "DELETE FROM " . TB_PREF . "wh_transfer_order_lines WHERE transfer_id=" . (int)$transfer_id;
-	db_query($sql, 'could not delete transfer order lines');
-
-	$sql = "DELETE FROM " . TB_PREF . "wh_transfer_orders WHERE transfer_id=" . (int)$transfer_id;
-	db_query($sql, 'could not delete transfer order');
-	commit_transaction();
-
-	return true;
+    require_once __DIR__.'/warehouse_transfer_core_db.inc';
+    $identity = dimension_writer_reference_id($transfer_id); $context = transfer_core_context();
+    if (!$identity || !$context) return false;
+    try {
+        if (!begin_transaction()) return false;
+        $history = transfer_core_history($identity);
+        $rows = transfer_core_rows('SELECT status FROM '.TB_PREF.'wh_transfer_orders WHERE transfer_id='.$identity.' FOR UPDATE');
+        $source = $rows ? transfer_core_source($identity, $rows[0]['status'], true) : false;
+        if (!$history || $history['drafts'] || !$source || !in_array($source['header']['status'], array('draft','cancelled'), true)
+            || (int)$source['header']['requested_by'] !== (int)$_SESSION['wa_current_user']->user
+            || !empty($source['header']['approved_by']) || $source['header']['custom_data'] !== null) { cancel_transaction(); return false; }
+        foreach ($source['lines'] as $line)
+            if ($line['custom_data'] !== null) { cancel_transaction(); return false; }
+        if (!db_query('DELETE FROM '.TB_PREF.'wh_transfer_order_lines WHERE transfer_id='.$identity)
+            || !db_query('DELETE FROM '.TB_PREF.'wh_transfer_orders WHERE transfer_id='.$identity)
+            || db_num_affected_rows() !== 1 || transfer_core_context() !== $context
+            || transfer_core_history($identity) !== $history
+            || transfer_core_rows('SELECT * FROM '.TB_PREF.'wh_transfer_orders WHERE transfer_id='.$identity.' FOR UPDATE') !== array()
+            || transfer_core_rows('SELECT * FROM '.TB_PREF.'wh_transfer_order_lines WHERE transfer_id='.$identity.' FOR UPDATE') !== array()
+            || !commit_transaction()) { cancel_transaction(); return false; }
+        return true;
+    } catch (Exception $exception) { cancel_transaction(); return false;
+    } catch (Throwable $exception) { cancel_transaction(); return false; }
 }
 
 // =====================================================================
@@ -459,6 +417,7 @@ function get_transfer_order_submission_data($transfer_id)
 	while ($line = db_fetch($lines)) {
 		$line_data[] = array(
 			'line_id' => (int)$line['line_id'],
+			'memo' => $line['memo'] === null ? '' : $line['memo'],
 			'stock_id' => $line['stock_id'],
 			'description' => isset($line['item_description']) ? $line['item_description'] : '',
 			'units' => isset($line['item_units']) ? $line['item_units'] : '',
@@ -491,8 +450,8 @@ function get_transfer_order_submission_data($transfer_id)
 		'request_date' => $order['request_date'],
 		'expected_ship_date' => $order['expected_ship_date'] ? $order['expected_ship_date'] : '',
 		'expected_recv_date' => $order['expected_recv_date'] ? $order['expected_recv_date'] : '',
-		'reference' => $order['reference'] ? $order['reference'] : '',
-		'memo' => $order['memo'] ? $order['memo'] : '',
+		'reference' => $order['reference'] === null ? '' : $order['reference'],
+		'memo' => $order['memo'] === null ? '' : $order['memo'],
 		'requested_by' => (int)$order['requested_by'],
 		'requested_by_name' => isset($order['requested_by_name']) ? $order['requested_by_name'] : '',
 		'line_count' => count($line_data),
@@ -509,22 +468,7 @@ function get_transfer_order_submission_data($transfer_id)
  */
 function submit_transfer_order($transfer_id)
 {
-	$order = get_transfer_order($transfer_id);
-	if (!$order || $order['status'] !== 'draft')
-		return false;
-
-	$line_count = count_transfer_order_lines($transfer_id);
-	if ($line_count <= 0)
-		return false;
-
-	$sql = "UPDATE " . TB_PREF . "wh_transfer_orders SET "
-		. "status='submitted',"
-		. "updated_at=NOW()"
-		. " WHERE transfer_id=" . (int)$transfer_id
-		. " AND status='draft'";
-
-	db_query($sql, 'could not submit transfer order');
-	return db_num_affected_rows() > 0;
+    return submit_transfer_order_for_core_approval($transfer_id) !== false;
 }
 
 /**
@@ -535,61 +479,8 @@ function submit_transfer_order($transfer_id)
  */
 function submit_transfer_order_for_core_approval($transfer_id)
 {
-	$order = get_transfer_order($transfer_id);
-	if (!$order || $order['status'] !== 'draft')
-		return false;
-
-	if (count_transfer_order_lines($transfer_id) <= 0)
-		return false;
-
-	$approval_registered = class_exists('ApprovalWorkflow') && ApprovalWorkflow::isRegistered(ST_WH_TRANSFER_ORDER);
-	$approval_amount = (float)get_transfer_order_total_value($transfer_id);
-	$approval_required = false;
-	$approval = null;
-
-	if ($approval_registered) {
-		$approval = get_approval_workflow_service();
-		$approval_required = $approval->isApprovalRequired(ST_WH_TRANSFER_ORDER, $approval_amount);
-	}
-
-	if (!submit_transfer_order($transfer_id))
-		return false;
-
-	if (!$approval_registered || !$approval_required) {
-		if (!approve_transfer_order($transfer_id))
-			return false;
-
-		return array('status' => 'auto_approved', 'transfer_id' => (int)$transfer_id);
-	}
-
-	$reloaded = get_transfer_order($transfer_id);
-	$draft_data = get_transfer_order_submission_data($transfer_id);
-	if ($draft_data === false)
-		return false;
-
-	$result = $approval->submit(
-		ST_WH_TRANSFER_ORDER,
-		$draft_data,
-		$approval_amount,
-		array(
-			'summary' => sprintf(_('Transfer Order TO-%s'), str_pad($reloaded['transfer_no'], 4, '0', STR_PAD_LEFT)),
-			'currency' => get_company_pref('curr_default'),
-			'person_type' => PT_MISC,
-			'person_id' => $reloaded['requested_by'],
-			'loc_code' => $reloaded['from_loc_code'],
-		)
-	);
-
-	if (isset($result['status']) && $result['status'] === 'execution_failed') {
-		$sql = "UPDATE " . TB_PREF . "wh_transfer_orders SET "
-			. "status='draft',"
-			. "updated_at=NOW()"
-			. " WHERE transfer_id=" . (int)$transfer_id
-			. " AND status='submitted'";
-		db_query($sql, 'could not rollback transfer order to draft after approval execution failure');
-	}
-
-	return $result;
+    require_once __DIR__.'/warehouse_transfer_core_db.inc';
+    return submit_native_transfer_to_core($transfer_id);
 }
 
 /**
@@ -598,20 +489,10 @@ function submit_transfer_order_for_core_approval($transfer_id)
  * @param int $transfer_id Transfer order ID
  * @return bool Success
  */
-function approve_transfer_order($transfer_id) {
-	$order = get_transfer_order($transfer_id);
-	if (!$order || $order['status'] !== 'submitted')
-		return false;
-
-	$sql = "UPDATE " . TB_PREF . "wh_transfer_orders SET "
-		. "status='approved',"
-		. "approved_by=" . (int)$_SESSION['wa_current_user']->user . ","
-		. "approval_date=NOW(),"
-		. "updated_at=NOW()"
-		. " WHERE transfer_id=" . (int)$transfer_id;
-
-	db_query($sql, 'could not approve transfer order');
-	return db_num_affected_rows() > 0;
+function approve_transfer_order($transfer_id)
+{
+    // Final decisions belong exclusively to the registered shared-core handler.
+    return false;
 }
 
 /**
@@ -622,18 +503,8 @@ function approve_transfer_order($transfer_id) {
  */
 function reject_transfer_order($transfer_id)
 {
-	$order = get_transfer_order($transfer_id);
-	if (!$order || $order['status'] !== 'submitted')
-		return false;
-
-	$sql = "UPDATE " . TB_PREF . "wh_transfer_orders SET "
-		. "status='draft',"
-		. "updated_at=NOW()"
-		. " WHERE transfer_id=" . (int)$transfer_id
-		. " AND status='submitted'";
-
-	db_query($sql, 'could not reject transfer order');
-	return db_num_affected_rows() > 0;
+    // Final decisions belong exclusively to the registered shared-core handler.
+    return false;
 }
 
 /**
@@ -646,10 +517,35 @@ function reject_transfer_order($transfer_id)
  */
 function ship_transfer_order($transfer_id, $ship_date) {
 	global $path_to_root;
+    require_once __DIR__.'/warehouse_transfer_fulfillment_db.inc';
 
-	$order = get_transfer_order($transfer_id);
-	if (!$order || !in_array($order['status'], array('approved')))
-		return false;
+    $context = transfer_core_context();
+    $identity = dimension_writer_reference_id($transfer_id);
+    if (!$context || !$identity || !is_string($ship_date) || !is_date($ship_date)) return false;
+    try {
+    if (!begin_transaction()) return false;
+    // This is a stock-posting command, not an approval-status reader. The
+    // independent core receipt and complete source are locked in the same
+    // transaction as the move. Linked demand additionally requires its exact
+    // valued origin; only actual destination receipts may satisfy that demand.
+    require_once __DIR__.'/warehouse_transfer_terminal_db.inc';
+    $custody = transfer_fulfillment_dispatch_custody($identity);
+    if (!$custody || !transfer_core_dependencies($custody['source'], 'dispatch')) {
+        cancel_transaction(); return false;
+    }
+    $order = get_transfer_order($identity);
+    if (!$order || $order['status'] !== 'approved') { cancel_transaction(); return false; }
+    $sql_date = date2sql($ship_date);
+    if (!is_string($sql_date) || !preg_match('/^[0-9]{4}-[0-9]{2}-[0-9]{2}$/D', $sql_date)) {
+        cancel_transaction(); return false;
+    }
+    if ($sql_date < $order['request_date'] || !transfer_fulfillment_period_allowed($sql_date)) {
+        cancel_transaction(); return false;
+    }
+    if (isset($custody['material']) && !transfer_fulfillment_material_stock_allowed($custody['source'], $sql_date)) {
+        cancel_transaction(); return false;
+    }
+    $movement_ids = array();
 
 	$inv_root = dirname(dirname(dirname(dirname(dirname(__FILE__))))); // → project root
 	include_once($inv_root . '/includes/db/inventory_db.inc');
@@ -658,13 +554,12 @@ function ship_transfer_order($transfer_id, $ship_date) {
 	include_once($inv_root . '/inventory/includes/db/stock_batches_db.inc');
 	include_once($inv_root . '/inventory/warehouse/includes/warehouse_operations.inc');
 
-	begin_transaction();
-
 	// Create a system transfer transaction for stock moves
 	$transfer_trans_no = get_next_trans_no(ST_LOCTRANSFER);
+    if (!dimension_writer_reference_id($transfer_trans_no)) { cancel_transaction(); return false; }
 
-	$lines = get_transfer_order_lines($transfer_id);
-	$sql_date = date2sql($ship_date);
+	$lines = get_transfer_order_lines($identity);
+    if (!$lines) { cancel_transaction(); return false; }
 
 	while ($line = db_fetch($lines)) {
 		$qty = $line['qty_requested'];
@@ -680,15 +575,20 @@ function ship_transfer_order($transfer_id, $ship_date) {
 			$extended['from_bin_id'] = (int)$line['from_bin_id'];
 		$extended['stock_status'] = 'in_transit';
 
-		add_stock_move_extended(ST_LOCTRANSFER, $stock_id, $transfer_trans_no,
+		$movement_id = add_stock_move_extended(ST_LOCTRANSFER, $stock_id, $transfer_trans_no,
 			$order['from_loc_code'], $ship_date, $order['reference'] ? $order['reference'] : 'TO-'.$order['transfer_no'],
 			-$qty, $line['unit_cost'], 0, $extended);
+        if (!dimension_writer_reference_id($movement_id)) { cancel_transaction(); return false; }
+        $movement_ids[(int)$line['line_id']] = (int)$movement_id;
 
 		// Update shipped qty on line
 		$sql = "UPDATE " . TB_PREF . "wh_transfer_order_lines SET "
 			. "qty_shipped=" . (float)$qty
-			. " WHERE line_id=" . (int)$line['line_id'];
-		db_query($sql, 'could not update line shipped qty');
+			. " WHERE line_id=" . (int)$line['line_id'] . " AND transfer_id=" . $identity
+            . " AND qty_shipped=0 AND qty_received=0";
+		if (!db_query($sql, 'could not update line shipped qty') || db_num_affected_rows() !== 1) {
+            cancel_transaction(); return false;
+        }
 
 		// Serial: mark as in_transit
 		if ($line['serial_id']) {
@@ -745,34 +645,118 @@ function ship_transfer_order($transfer_id, $ship_date) {
 		. "shipped_by=" . (int)$_SESSION['wa_current_user']->user . ","
 		. "actual_ship_date=" . db_escape($sql_date) . ","
 		. "updated_at=NOW()"
-		. " WHERE transfer_id=" . (int)$transfer_id;
-	db_query($sql, 'could not update transfer order status to shipped');
+		. " WHERE transfer_id=" . $identity
+        . " AND status='approved' AND shipped_by IS NULL AND actual_ship_date IS NULL";
+	if (!db_query($sql, 'could not update transfer order status to shipped') || db_num_affected_rows() !== 1
+        || transfer_core_context() !== $context) { cancel_transaction(); return false; }
 
 	add_audit_trail(ST_LOCTRANSFER, $transfer_trans_no, $ship_date);
 
-	commit_transaction();
+	if (!transfer_core_dependencies($custody['source'], 'receipt')
+        || !transfer_fulfillment_period_allowed($sql_date)
+        || !transfer_fulfillment_record($identity, $custody, 'dispatch', $sql_date, $movement_ids)
+        || !transfer_fulfillment_period_allowed($sql_date)
+        || (isset($custody['material']) && !transfer_fulfillment_material_stock_allowed($custody['source'], $sql_date, true))
+        || !transfer_core_dependencies($custody['source'], 'receipt')
+        || transfer_core_context() !== $context) { cancel_transaction(); return false; }
+	if (!commit_transaction()) { cancel_transaction(); return false; }
 	return true;
+    } catch (Exception $exception) { cancel_transaction(); return false;
+    } catch (Throwable $exception) { cancel_transaction(); return false; }
+}
+
+/**
+ * Validate exactly one locked receipt request; rejects negatives, NaN,
+ * unknown line IDs, and over-receipt before any stock mutation. A missing key
+ * retains the form's ordinary "receive all outstanding" behavior.
+ */
+function transfer_fulfillment_receipt_plan($locked_lines, $received)
+{
+    if (!is_array($locked_lines) || !$locked_lines || !is_array($received)) return false;
+    $plan = array(); $positive = false;
+    foreach ($locked_lines as $line) {
+        if (!is_array($line) || !isset($line['line_id'], $line['qty_requested'],
+            $line['qty_shipped'], $line['qty_received'])) return false;
+        $id = dimension_writer_reference_id($line['line_id']);
+        if (!$id || isset($plan[$id])) return false;
+        foreach (array('qty_requested','qty_shipped','qty_received') as $field)
+            if (!is_numeric($line[$field]) || !is_finite((float)$line[$field])) return false;
+        $shipped = (float)$line['qty_shipped'];
+        $outstanding = round($shipped - (float)$line['qty_received'], 4);
+        if ($shipped <= 0 || $shipped > (float)$line['qty_requested']
+            || (float)$line['qty_received'] < 0 || $outstanding < 0) return false;
+        $request = array_key_exists($id, $received) ? $received[$id] : $outstanding;
+        if ((!is_int($request) && !is_float($request) && !is_string($request))
+            || !is_numeric($request) || !is_finite((float)$request)) return false;
+        $qty = (float)$request;
+        if ($qty < 0 || $qty > $outstanding || round($qty, 4) !== $qty
+            || (!empty($line['serial_id']) && $qty != 0 && $qty != 1)) return false;
+        if ($qty > 0) $positive = true;
+        $plan[$id] = $qty;
+    }
+    foreach ($received as $key=>$qty)
+        if (!dimension_writer_reference_id($key) || !array_key_exists((int)$key, $plan)) return false;
+    return $positive ? $plan : false;
 }
 
 /**
  * Receive a transfer order (full or partial): creates stock moves into destination,
- * updates serial/batch statuses, and optionally creates a backorder for remainder.
+ * updates serial/batch statuses, and retains outstanding shipped items on this order.
  *
  * @param int    $transfer_id Transfer order ID
  * @param string $recv_date   Receive date (display format)
  * @param array  $received    Array of line_id => qty_received
+ * @param string|null $expected_source Optional exact rendered source fingerprint for stale-form denial
  * @return array Result: ['success'=>bool, 'backorder_id'=>int|null, 'message'=>string]
  */
-function receive_transfer_order($transfer_id, $recv_date, $received = array()) {
+function receive_transfer_order($transfer_id, $recv_date, $received = array(), $expected_source = null) {
 	global $path_to_root;
+    require_once __DIR__.'/warehouse_transfer_fulfillment_db.inc';
 
 	$result = array('success' => false, 'backorder_id' => null, 'message' => '');
 
-	$order = get_transfer_order($transfer_id);
-	if (!$order || !in_array($order['status'], array('in_transit', 'shipped'))) {
-		$result['message'] = _('Transfer order is not in a receivable state.');
-		return $result;
-	}
+    $context = transfer_core_context();
+    $identity = dimension_writer_reference_id($transfer_id);
+    if (!$context || !$identity || !is_string($recv_date) || !is_date($recv_date) || !is_array($received)) return $result;
+    try {
+    if (!begin_transaction()) return $result;
+    $custody = transfer_fulfillment_custody($identity);
+    if (!$custody || ($expected_source !== null && (!is_string($expected_source)
+        || !hash_equals(transfer_core_source_fingerprint($custody['source']), $expected_source)))) {
+        cancel_transaction();
+        $result['message'] = _('Transfer receipt evidence or quantities have changed. Reload this order before receiving items.');
+        return $result;
+    }
+    if (!transfer_fulfillment_reference_locks($custody['source'], isset($custody['material']) ? $custody['material'] : null)) {
+        cancel_transaction(); return $result;
+    }
+    // Serialize duplicate receipts and cancellation against the real current
+    // header, not an earlier page read. All quantities are validated under the
+    // same InnoDB locks before the first inbound stock move is written.
+    $header = transfer_core_rows('SELECT * FROM '.TB_PREF.'wh_transfer_orders WHERE transfer_id='.$identity.' FOR UPDATE');
+    $locked_lines = transfer_core_rows('SELECT * FROM '.TB_PREF.'wh_transfer_order_lines WHERE transfer_id='.$identity.' ORDER BY line_id FOR UPDATE');
+    if (!$header || count($header) !== 1 || !in_array($header[0]['status'], array('in_transit','shipped'), true)
+        || empty($header[0]['shipped_by']) || $header[0]['actual_ship_date'] === null
+        || !empty($header[0]['received_by']) || $header[0]['actual_recv_date'] !== null
+        || !$locked_lines) { cancel_transaction(); return $result; }
+    $order = get_transfer_order($identity);
+    if (!$order || $order['status'] !== $header[0]['status']) { cancel_transaction(); return $result; }
+    $planned = transfer_fulfillment_receipt_plan($locked_lines, $received);
+    if ($planned === false) {
+        cancel_transaction();
+        $result['message'] = _('Invalid receipt quantities or no items selected for receipt.');
+        return $result;
+    }
+    // Only this event's selected lines acquire new receipt authority. A serial
+    // received earlier may legitimately have moved again since a partial receipt.
+    $receipt_source = $custody['source']; $receipt_source['lines'] = array();
+    foreach ($locked_lines as $line)
+        if ($planned[(int)$line['line_id']] > 0) $receipt_source['lines'][] = $line;
+    if (!transfer_core_dependencies($receipt_source, 'receipt')) {
+        cancel_transaction();
+        $result['message'] = _('Transfer receipt item, location or tracking state is unavailable.');
+        return $result;
+    }
 
 	$inv_root = dirname(dirname(dirname(dirname(dirname(__FILE__))))); // → project root
 	include_once($inv_root . '/includes/db/inventory_db.inc');
@@ -781,25 +765,33 @@ function receive_transfer_order($transfer_id, $recv_date, $received = array()) {
 	include_once($inv_root . '/inventory/includes/db/stock_batches_db.inc');
 	include_once($inv_root . '/inventory/warehouse/includes/warehouse_operations.inc');
 
-	begin_transaction();
-
 	$transfer_trans_no = get_next_trans_no(ST_LOCTRANSFER);
 	$sql_date = date2sql($recv_date);
+    if (!dimension_writer_reference_id($transfer_trans_no) || !is_string($sql_date)
+        || !preg_match('/^[0-9]{4}-[0-9]{2}-[0-9]{2}$/D', $sql_date)) { cancel_transaction(); return $result; }
+    if ($sql_date < $order['actual_ship_date'] || !transfer_fulfillment_period_allowed($sql_date)) {
+        cancel_transaction();
+        $result['message'] = _('The receipt date must be in an authorized open accounting period.');
+        return $result;
+    }
+	$movement_ids = array();
 	$has_shortage = false;
-	$backorder_lines = array();
 
-	$lines = get_transfer_order_lines($transfer_id);
+	$lines = get_transfer_order_lines($identity);
+    if (!$lines) { cancel_transaction(); return $result; }
 	while ($line = db_fetch($lines)) {
 		$line_id = (int)$line['line_id'];
 		$qty_shipped = (float)$line['qty_shipped'];
 		$stock_id = $line['stock_id'];
 
-		// Determine qty to receive
-		$qty_recv = isset($received[$line_id]) ? (float)$received[$line_id] : $qty_shipped;
-		if ($qty_recv > $qty_shipped)
-			$qty_recv = $qty_shipped;
-		if ($qty_recv <= 0)
-			continue;
+		// The locked plan retains zero receipts as outstanding shipped quantities.
+        // Never clamp an over-receipt or silently skip an invalid quantity.
+        if (!array_key_exists($line_id, $planned)) { cancel_transaction(); return $result; }
+        $qty_recv = $planned[$line_id];
+        if ($qty_recv <= 0) {
+            if ($qty_shipped > (float)$line['qty_received']) $has_shortage = true;
+            continue;
+        }
 
 		// Create inbound stock move to destination
 		$extended = array();
@@ -811,17 +803,22 @@ function receive_transfer_order($transfer_id, $recv_date, $received = array()) {
 			$extended['to_bin_id'] = (int)$line['to_bin_id'];
 		$extended['stock_status'] = 'available';
 
-		add_stock_move_extended(ST_LOCTRANSFER, $stock_id, $transfer_trans_no,
+		$movement_id = add_stock_move_extended(ST_LOCTRANSFER, $stock_id, $transfer_trans_no,
 			$order['to_loc_code'], $recv_date,
 			$order['reference'] ? $order['reference'] : 'TO-'.$order['transfer_no'],
 			$qty_recv, $line['unit_cost'], 0, $extended);
+        if (!dimension_writer_reference_id($movement_id)) { cancel_transaction(); return $result; }
+        $movement_ids[$line_id] = (int)$movement_id;
 
 		// Update received qty on line
-		$new_recv = (float)$line['qty_received'] + $qty_recv;
+		$new_recv = round((float)$line['qty_received'] + $qty_recv, 4);
 		$sql = "UPDATE " . TB_PREF . "wh_transfer_order_lines SET "
 			. "qty_received=" . $new_recv
-			. " WHERE line_id=" . $line_id;
-		db_query($sql, 'could not update line received qty');
+			. " WHERE line_id=" . $line_id . " AND transfer_id=" . $identity
+            . " AND qty_received=" . db_escape($line['qty_received']);
+		if (!db_query($sql, 'could not update line received qty') || db_num_affected_rows() !== 1) {
+            cancel_transaction(); return $result;
+        }
 
 		// Serial: mark as available at destination
 		if ($line['serial_id']) {
@@ -882,7 +879,7 @@ function receive_transfer_order($transfer_id, $recv_date, $received = array()) {
 					$serial_error
 				);
 				if (!$serial_reconcile['success']) {
-					rollback_transaction();
+					cancel_transaction();
 					$result['message'] = $serial_error !== '' ? $serial_error : _('Transfer receipt serial reconciliation failed.');
 					return $result;
 				}
@@ -898,68 +895,50 @@ function receive_transfer_order($transfer_id, $recv_date, $received = array()) {
 		}
 
 		// Check for shortage (partial receipt)
-		$shortage = $qty_shipped - $qty_recv;
-		if ($shortage > 0.0001) {
-			$has_shortage = true;
-			$backorder_lines[] = array(
-				'stock_id'    => $stock_id,
-				'qty'         => $shortage,
-				'from_bin_id' => $line['from_bin_id'],
-				'to_bin_id'   => $line['to_bin_id'],
-				'batch_id'    => $line['batch_id'],
-				'serial_id'   => null, // Don't carry serial to backorder
-				'unit_cost'   => $line['unit_cost'],
-			);
-		}
+		$shortage = round($qty_shipped - $new_recv, 4);
+        if ($shortage > 0) $has_shortage = true;
 	}
 
+    if (!$has_shortage) {
 	// Mark order as received
 	$sql = "UPDATE " . TB_PREF . "wh_transfer_orders SET "
 		. "status='received',"
 		. "received_by=" . (int)$_SESSION['wa_current_user']->user . ","
 		. "actual_recv_date=" . db_escape($sql_date) . ","
 		. "updated_at=NOW()"
-		. " WHERE transfer_id=" . (int)$transfer_id;
-	db_query($sql, 'could not update transfer order status to received');
+		. " WHERE transfer_id=" . $identity
+        . " AND status=" . db_escape($header[0]['status']) . " AND received_by IS NULL AND actual_recv_date IS NULL";
+	if (!db_query($sql, 'could not update transfer order status to received') || db_num_affected_rows() !== 1
+        || transfer_core_context() !== $context) { cancel_transaction(); return $result; }
+
+    }
+    if (transfer_core_context() !== $context) { cancel_transaction(); return $result; }
 
 	add_audit_trail(ST_LOCTRANSFER, $transfer_trans_no, $recv_date);
 
-	// Create backorder for shortages
-	$backorder_id = null;
-	if ($has_shortage && !empty($backorder_lines)) {
-		$backorder_id = add_transfer_order(
-			$order['from_loc_code'],
-			$order['to_loc_code'],
-			$sql_date,
-			'backorder',
-			'BO-TO-' . $order['transfer_no'],
-			sprintf(_('Backorder from Transfer Order #%d (partial receipt)'), $order['transfer_no'])
-		);
-		foreach ($backorder_lines as $bl) {
-			add_transfer_order_line(
-				$backorder_id,
-				$bl['stock_id'],
-				$bl['qty'],
-				$bl['from_bin_id'],
-				$bl['to_bin_id'],
-				$bl['batch_id'],
-				$bl['serial_id'],
-				$bl['unit_cost']
-			);
-		}
-	}
+    // A partial receipt leaves the already shipped remainder on this transfer.
+    // Creating a dispatchable backorder here would issue the same goods twice.
+    $backorder_id = null;
 
-	commit_transaction();
+	if (!transfer_core_dependencies($receipt_source, 'received')
+        || !transfer_fulfillment_period_allowed($sql_date)
+        || !transfer_fulfillment_record($identity, $custody, 'receipt', $sql_date, $movement_ids)
+        || !transfer_fulfillment_period_allowed($sql_date)
+        || !transfer_core_dependencies($receipt_source, 'received')
+        || transfer_core_context() !== $context) { cancel_transaction(); return $result; }
+	if (!commit_transaction()) { cancel_transaction(); return $result; }
 
 	$result['success'] = true;
 	$result['backorder_id'] = $backorder_id;
-	if ($backorder_id) {
-		$result['message'] = sprintf(_('Transfer order received (partial). Backorder #%d created for remaining items.'), $backorder_id);
+	if ($has_shortage) {
+		$result['message'] = _('Transfer order partially received. Remaining shipped items await receipt on this order.');
 	} else {
 		$result['message'] = _('Transfer order fully received.');
 	}
 
 	return $result;
+    } catch (Exception $exception) { cancel_transaction(); return $result;
+    } catch (Throwable $exception) { cancel_transaction(); return $result; }
 }
 
 /**
@@ -968,83 +947,19 @@ function receive_transfer_order($transfer_id, $recv_date, $received = array()) {
  * @param int $transfer_id Transfer order ID
  * @return bool Success
  */
-function cancel_transfer_order($transfer_id) {
-	$order = get_transfer_order($transfer_id);
-	if (!$order || in_array($order['status'], array('received', 'cancelled')))
-		return false;
-
-	// If already shipped/in_transit, we need to reverse stock moves
-	if (in_array($order['status'], array('shipped', 'in_transit'))) {
-		$inv_root = dirname(dirname(dirname(dirname(dirname(__FILE__)))));
-		include_once($inv_root . '/includes/db/inventory_db.inc');
-		include_once($inv_root . '/inventory/includes/db/serial_numbers_db.inc');
-		include_once($inv_root . '/inventory/includes/db/stock_batches_db.inc');
-
-		begin_transaction();
-
-		$lines = get_transfer_order_lines($transfer_id);
-		while ($line = db_fetch($lines)) {
-			// Reverse serial status
-			if ($line['serial_id'] && function_exists('update_serial_status')) {
-				update_serial_status(
-					(int)$line['serial_id'],
-					'available',
-					ST_LOCTRANSFER,
-					0,
-					$order['to_loc_code'],
-					$order['from_loc_code'],
-					Today(),
-					'',
-					sprintf(_('Transfer Order #%d cancelled'), $order['transfer_no'])
-				);
-				// Restore serial to source location
-				$sql = "UPDATE " . TB_PREF . "serial_numbers SET "
-					. "loc_code=" . db_escape($order['from_loc_code'])
-					. " WHERE id=" . (int)$line['serial_id'];
-				db_query($sql, 'could not restore serial location');
-			}
-
-			// Reverse batch movements
-			if ($line['batch_id'] && function_exists('add_batch_movement')) {
-				add_batch_movement(
-					(int)$line['batch_id'],
-					ST_LOCTRANSFER,
-					0,
-					$order['from_loc_code'],
-					null,
-					$line['qty_shipped'],
-					Today(),
-					'',
-					sprintf(_('Transfer Order #%d cancelled — stock returned'), $order['transfer_no'])
-				);
-			}
-
-			// Restore bin stock at source
-			if ($line['from_bin_id'] && function_exists('update_bin_stock')) {
-				update_bin_stock(
-					(int)$line['from_bin_id'],
-					$line['stock_id'],
-					$line['qty_shipped'],
-					$line['batch_id'] ? (int)$line['batch_id'] : null,
-					$line['serial_id'] ? (int)$line['serial_id'] : null
-				);
-			}
-		}
-
-		$sql = "UPDATE " . TB_PREF . "wh_transfer_orders SET "
-			. "status='cancelled', updated_at=NOW()"
-			. " WHERE transfer_id=" . (int)$transfer_id;
-		db_query($sql, 'could not cancel transfer order');
-
-		commit_transaction();
-	} else {
-		$sql = "UPDATE " . TB_PREF . "wh_transfer_orders SET "
-			. "status='cancelled', updated_at=NOW()"
-			. " WHERE transfer_id=" . (int)$transfer_id;
-		db_query($sql, 'could not cancel transfer order');
-	}
-
-	return true;
+function cancel_transfer_order($transfer_id, $comments = '') {
+    require_once __DIR__.'/warehouse_transfer_terminal_db.inc';
+    $identity = dimension_writer_reference_id($transfer_id);
+    if (!$identity || !transfer_core_context()) return false;
+    // Read-only hint: every writer re-reads and locks the exact state and history.
+    $order = get_transfer_order($identity);
+    if (!$order) return false;
+    if ($order['status'] === 'submitted') return cancel_native_transfer_core($identity, $comments);
+    if ($order['status'] === 'draft') return cancel_native_transfer_draft($identity);
+    if ($order['status'] === 'approved') return cancel_native_transfer_approved($identity, $comments);
+    // Shipped/in-transit stock, serial, batch and GL inverse custody is not
+    // established. Deny rather than author an unbalanced or double reversal.
+    return false;
 }
 
 /**

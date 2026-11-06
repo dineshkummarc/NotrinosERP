@@ -69,6 +69,19 @@ if (!$draft) {
 $current_user_id = $_SESSION['wa_current_user']->user;
 $current_role_id = $_SESSION['wa_current_user']->access;
 
+// Native details use only the purpose-admitted registered review renderer, never generic raw draft fields.
+if (approval_draft_requires_native_reader($draft)) {
+	header('Cache-Control: no-store, private, max-age=0');
+	header('Pragma: no-cache');
+	header('X-Content-Type-Options: nosniff');
+	header('Referrer-Policy: no-referrer');
+	include_once($path_to_root.'/hrm/includes/db/pay_glb_001_native_reader_db.inc');
+	$native_error=null;$native_payload=pay_glb_001_native_approval_decode($draft,$native_error);
+	if (!isset($_SERVER['REQUEST_METHOD']) || $_SERVER['REQUEST_METHOD']!=='GET' || $native_payload===false) display_notification(_('Native payroll review is unavailable for this request.'));
+	else render_payroll_period_draft($native_payload);
+	end_page();exit;
+}
+
 // =====================================================
 // Handle approval/rejection actions
 // =====================================================
@@ -277,14 +290,35 @@ echo "<h3 style='margin:16px 0 8px 0;'>"
 
 $draft_data = null;
 $raw_draft_data = $draft['draft_data'];
-if ($raw_draft_data) {
+$agreement_reviews = array(
+    ST_PURCHAGREEMENT=>array('schema'=>'purchase_agreement_schema','security'=>'SA_PURCHAGREEMENT'),
+    ST_SALESAGREEMENT=>array('schema'=>'sales_agreement_schema','security'=>'SA_SALESAGREEMENT'));
+$agreement_review = isset($agreement_reviews[(int)$draft['trans_type']]) ? $agreement_reviews[(int)$draft['trans_type']] : null;
+if ($agreement_review !== null || (int)$draft['trans_type'] === ST_SALESORDER) {
+	$draft_data = get_approval_workflow_service()->decodeStoredDraftData($raw_draft_data);
+} elseif ($raw_draft_data) {
 	$draft_data = json_decode($raw_draft_data, true);
 	if ($draft_data === null)
 		$draft_data = json_decode(stripslashes($raw_draft_data), true);
 	if ($draft_data === null)
 		$draft_data = json_decode(html_entity_decode($raw_draft_data, ENT_QUOTES, 'UTF-8'), true);
 }
-if ($draft_data && is_array($draft_data)) {
+if ((int)$draft['trans_type'] === ST_SALESORDER && is_array($draft_data) && isset($draft_data['native_sales_order'])) {
+    if($_SESSION['wa_current_user']->can_access('SA_SALESORDER'))echo render_native_sales_order_draft($draft_data);
+    else display_note(_('Sales order review is unavailable for this role.'));
+} elseif ((int)$draft['trans_type'] === ST_SALESORDER && is_array($draft_data) && isset($draft_data['agreement_conversion'])) {
+    if ($_SESSION['wa_current_user']->can_access('SA_SALESORDER') && $_SESSION['wa_current_user']->can_access('SA_SALESAGREEMENT'))
+        echo render_agreement_sales_order_draft($draft_data);
+    else display_note(_('Sales agreement order review is unavailable for this role.'));
+} elseif ($agreement_review !== null && is_array($draft_data)
+	&& isset($draft_data[$agreement_review['schema']]) && $draft_data[$agreement_review['schema']] === 'native-v1') {
+	$config = ApprovalWorkflow::getTypeConfig((int)$draft['trans_type']);
+	if ($_SESSION['wa_current_user']->can_access($agreement_review['security']) && $config
+		&& isset($config['draft_renderer']) && is_callable($config['draft_renderer']))
+		echo call_user_func($config['draft_renderer'],$draft_data);
+	else
+		display_note(_('Purchase agreement review is unavailable for this role.'));
+} elseif ($draft_data && is_array($draft_data)) {
 	// Friendly labels map
 	$field_labels = array(
 		'customer_name'     => _('Customer'),

@@ -41,7 +41,122 @@ function reserve_approval_trans_number($trans_type, $context = array())
 	if (!isset($context['date']) || !$context['date'])
 		$context['date'] = new_doc_date();
 
-	$next_no = get_next_trans_no($trans_type);
+    $native_reference = null;
+    if (defined('ST_SALESORDER') && (int)$trans_type === ST_SALESORDER && isset($context['native_sales_order_reference'])) {
+        $native_reference=$context['native_sales_order_reference'];
+        if(!is_string($native_reference) || trim($native_reference)!==$native_reference || $native_reference==='' || strlen($native_reference)>100
+            || (is_object($Refs) && method_exists($Refs,'is_valid') && !$Refs->is_valid($native_reference,ST_SALESORDER,$context)))return false;
+    }
+
+	if (defined('ST_PURCHREQUISITION') && (int)$trans_type === ST_PURCHREQUISITION && isset($context['requisition_id'])) {
+		// This approval transitions an already numbered native source. Its
+		// reference is current locked custody, not a second document refline.
+		$identity = $context['requisition_id'];
+		if ((!is_int($identity) && !is_string($identity)) || (int)$identity <= 0
+			|| (string)(int)$identity !== (string)$identity || empty($GLOBALS['transaction_level'])) return false;
+		$result = db_query('SELECT reference FROM '.TB_PREF.'purch_requisitions WHERE id='.(int)$identity
+			." AND status='submitted' FOR UPDATE", 'could not verify requisition approval reference');
+		$row = $result ? db_fetch_assoc($result) : false;
+		if (!$row || !is_string($row['reference']) || trim($row['reference']) === ''
+			|| strlen($row['reference']) > 60 || strpos($row['reference'], "\0") !== false) return false;
+		$native_reference = $row['reference'];
+	}
+	$native_number = null;
+	if (defined('ST_PURCHAGREEMENT') && (int)$trans_type === ST_PURCHAGREEMENT && isset($context['agreement_id'])) {
+		$identity = $context['agreement_id'];
+		if ((!is_int($identity) && !is_string($identity)) || (int)$identity <= 0
+			|| (string)(int)$identity !== (string)$identity || empty($GLOBALS['transaction_level'])) return false;
+		$result = db_query('SELECT reference FROM '.TB_PREF.'purch_agreements WHERE id='.(int)$identity." AND status='draft' FOR UPDATE");
+		$row = $result ? db_fetch_assoc($result) : false;
+		if (!$row || !is_string($row['reference']) || trim($row['reference']) === ''
+			|| strlen($row['reference']) > 60 || strpos($row['reference'], "\0") !== false) return false;
+		$native_reference = $row['reference']; $native_number = 0;
+		foreach (array('SELECT id FROM '.TB_PREF.'purch_agreements ORDER BY id DESC LIMIT 1 FOR UPDATE',
+			'SELECT id FROM '.TB_PREF.'voided WHERE type='.ST_PURCHAGREEMENT.' ORDER BY id DESC LIMIT 1 FOR UPDATE',
+			'SELECT reserved_trans_no FROM '.TB_PREF.'approval_drafts WHERE trans_type='.ST_PURCHAGREEMENT.' ORDER BY reserved_trans_no DESC,id DESC LIMIT 1 FOR UPDATE') as $sql) {
+			$result = db_query($sql); $last = $result ? db_fetch_row($result) : false;
+			if (!$result || ($last && (!is_numeric($last[0]) || (float)$last[0] < 0 || (float)$last[0] >= 2147483647))) return false;
+			if ($last) $native_number = max($native_number,(int)$last[0]);
+		}
+		$native_number++;
+	}
+	if (defined('ST_SALESAGREEMENT') && (int)$trans_type === ST_SALESAGREEMENT && isset($context['agreement_id'])) {
+		$identity = $context['agreement_id'];
+		if ((!is_int($identity) && !is_string($identity)) || (int)$identity <= 0
+			|| (string)(int)$identity !== (string)$identity || empty($GLOBALS['transaction_level'])) return false;
+		$result = db_query('SELECT reference FROM '.TB_PREF.'sales_agreements WHERE id='.(int)$identity." AND status='draft' FOR UPDATE");
+		$row = $result ? db_fetch_assoc($result) : false;
+		if (!$row || !is_string($row['reference']) || trim($row['reference']) === ''
+			|| strlen($row['reference']) > 60 || strpos($row['reference'], "\0") !== false) return false;
+		$native_reference = $row['reference']; $native_number = 0;
+		foreach (array('SELECT id FROM '.TB_PREF.'sales_agreements ORDER BY id DESC LIMIT 1 FOR UPDATE',
+			'SELECT id FROM '.TB_PREF.'voided WHERE type='.ST_SALESAGREEMENT.' ORDER BY id DESC LIMIT 1 FOR UPDATE',
+			'SELECT reserved_trans_no FROM '.TB_PREF.'approval_drafts WHERE trans_type='.ST_SALESAGREEMENT.' ORDER BY reserved_trans_no DESC,id DESC LIMIT 1 FOR UPDATE') as $sql) {
+			$result = db_query($sql); $last = $result ? db_fetch_row($result) : false;
+			if (!$result || ($last && (!is_numeric($last[0]) || (float)$last[0] < 0 || (float)$last[0] >= 2147483647))) return false;
+			if ($last) $native_number = max($native_number,(int)$last[0]);
+		}
+		$native_number++;
+	}
+	if (defined('ST_WH_MATERIAL_REQUEST') && (int)$trans_type === ST_WH_MATERIAL_REQUEST && isset($context['material_request_id'])) {
+		// Demand already owns a native number, even when its optional reference
+		// is blank. Approval must not depend on a second, absent refline setup.
+		$identity = $context['material_request_id'];
+		if ((!is_int($identity) && !is_string($identity)) || (int)$identity <= 0
+			|| (string)(int)$identity !== (string)$identity || empty($GLOBALS['transaction_level'])
+			|| !function_exists('format_material_request_no')) return false;
+		$result = db_query('SELECT request_no,reference FROM '.TB_PREF.'wh_material_requests WHERE request_id='.(int)$identity
+			." AND status='submitted' FOR UPDATE");
+		$row = $result ? db_fetch_assoc($result) : false;
+		if (!$row || (int)$row['request_no'] <= 0) return false;
+		$native_reference = $row['reference'] === null || $row['reference'] === '' ? format_material_request_no($row['request_no']) : $row['reference'];
+		if (!is_string($native_reference) || strlen($native_reference) > 60 || strpos($native_reference, "\0") !== false) return false;
+		$native_number = 0;
+		foreach (array('SELECT request_no FROM '.TB_PREF.'wh_material_requests ORDER BY request_no DESC LIMIT 1 FOR UPDATE',
+			'SELECT id FROM '.TB_PREF.'voided WHERE type='.ST_WH_MATERIAL_REQUEST.' ORDER BY id DESC LIMIT 1 FOR UPDATE',
+			// Successful demand approval releases its placeholder while retaining
+			// the draft. That immutable reservation must never be issued again.
+			'SELECT reserved_trans_no FROM '.TB_PREF.'approval_drafts WHERE trans_type='.ST_WH_MATERIAL_REQUEST
+				.' ORDER BY reserved_trans_no DESC,id DESC LIMIT 1 FOR UPDATE') as $sql) {
+			$result = db_query($sql); $last = $result ? db_fetch_row($result) : false;
+			if (!$result || ($last && (!is_numeric($last[0]) || (float)$last[0] < 0 || (float)$last[0] >= 2147483647))) return false;
+			if ($last) $native_number = max($native_number, (int)$last[0]);
+		}
+		$native_number++;
+	}
+
+	if (defined('ST_WH_TRANSFER_ORDER') && (int)$trans_type === ST_WH_TRANSFER_ORDER && isset($context['transfer_order_id'])) {
+		// Transfer already owns a native number, even when its optional reference
+		// is blank. Approval must not depend on a second, absent refline setup.
+		$identity = $context['transfer_order_id'];
+		if ((!is_int($identity) && !is_string($identity)) || (int)$identity <= 0
+			|| (string)(int)$identity !== (string)$identity || empty($GLOBALS['transaction_level'])) return false;
+		$result = db_query('SELECT transfer_no,reference FROM '.TB_PREF.'wh_transfer_orders WHERE transfer_id='.(int)$identity
+			." AND status='submitted' FOR UPDATE");
+		$row = $result ? db_fetch_assoc($result) : false;
+		if (!$row || (int)$row['transfer_no'] <= 0) return false;
+		$native_reference = $row['reference'] === null || $row['reference'] === '' ? 'TO-'.str_pad($row['transfer_no'], 4, '0', STR_PAD_LEFT) : $row['reference'];
+		if (!is_string($native_reference) || strlen($native_reference) > 60 || strpos($native_reference, "\0") !== false) return false;
+		$native_number = 0;
+		foreach (array('SELECT transfer_no FROM '.TB_PREF.'wh_transfer_orders ORDER BY transfer_no DESC LIMIT 1 FOR UPDATE',
+			'SELECT id FROM '.TB_PREF.'voided WHERE type='.ST_WH_TRANSFER_ORDER.' ORDER BY id DESC LIMIT 1 FOR UPDATE',
+			// Successful transfer approval releases its placeholder while retaining
+			// the draft. That immutable reservation must never be issued again.
+			'SELECT reserved_trans_no FROM '.TB_PREF.'approval_drafts WHERE trans_type='.ST_WH_TRANSFER_ORDER
+				.' ORDER BY reserved_trans_no DESC,id DESC LIMIT 1 FOR UPDATE') as $sql) {
+			$result = db_query($sql); $last = $result ? db_fetch_row($result) : false;
+			if (!$result || ($last && (!is_numeric($last[0]) || (float)$last[0] < 0 || (float)$last[0] >= 2147483647))) return false;
+			if ($last) $native_number = max($native_number, (int)$last[0]);
+		}
+		$native_number++;
+	}
+
+	// PO native keys auto-increment independently of retained approval numbers.
+	// A caller's consistent snapshot must not reserve an already committed key.
+	$next_no = $native_number !== null ? $native_number : ((int)$trans_type === ST_SALESORDER ? get_next_sales_order_approval_number() : ((int)$trans_type === ST_PURCHORDER
+		? get_next_purchase_order_approval_number() : get_next_trans_no($trans_type)));
+	if (!$next_no)
+		return false;
 
 	// Insert placeholder in voided table to consume the number.
 	// get_next_trans_no() checks voided table, so this prevents reuse.
@@ -52,15 +167,47 @@ function reserve_approval_trans_number($trans_type, $context = array())
 		. "NOW(), "
 		. db_escape('APPROVAL_RESERVED') . ")";
 
-	db_query($sql, 'could not reserve transaction number for approval');
+	if (!db_query($sql, 'could not reserve transaction number for approval'))
+		return false;
 
 	// Generate the reference string for this reserved number
 	$reference = '';
-	if (is_object($Refs)) {
+	if ($native_reference !== null) {
+		$reference = $native_reference;
+	} elseif (is_object($Refs)) {
 		$reference = $Refs->get_next($trans_type, null, $context);
 	}
 
+	if ((int)$trans_type===ST_SALESORDER && !sales_order_reference_available($reference,0))return false;
 	return array('trans_no' => $next_no, 'reference' => $reference);
+}
+
+/**
+ * Serialize PO reservations against native inserts using current InnoDB reads.
+ * Hold both sequence ranges until the existing outer workflow transaction ends.
+ * Native auto-increment and historical reservation/posted aliases stay unchanged.
+ * @return int|false Next current company PO number, or unavailable ownership
+ */
+function get_next_purchase_order_approval_number()
+{
+	if (empty($GLOBALS['transaction_level']))
+		return false;
+	$last_no = 0;
+	foreach (array(
+		'SELECT order_no FROM '.TB_PREF.'purch_orders ORDER BY order_no DESC LIMIT 1 FOR UPDATE',
+		'SELECT id FROM '.TB_PREF.'voided WHERE type='.ST_PURCHORDER.' ORDER BY id DESC LIMIT 1 FOR UPDATE'
+	) as $sql) {
+		$result = db_query($sql, 'could not verify current purchase order approval number');
+		if (!$result)
+			return false;
+		$row = db_fetch_row($result);
+		if ($row) {
+			if (!is_numeric($row[0]) || (float)$row[0] < 0 || (float)$row[0] >= 2147483647)
+				return false;
+			$last_no = max($last_no, (int)$row[0]);
+		}
+	}
+	return $last_no + 1;
 }
 
 /**
@@ -147,4 +294,25 @@ function get_approval_void_reason($trans_type, $trans_no)
 	$row = db_fetch($result);
 
 	return $row ? $row['memo_'] : false;
+}
+
+/** Share the current native Sales sequence with reserved and retained core identities. */
+function get_next_sales_order_approval_number()
+{
+    if(empty($GLOBALS['transaction_level']))return false;$last=0;
+    foreach(array('SELECT order_no FROM '.TB_PREF.'sales_orders WHERE trans_type='.ST_SALESORDER.' ORDER BY order_no DESC LIMIT 1 FOR UPDATE',
+        'SELECT id FROM '.TB_PREF.'voided WHERE type='.ST_SALESORDER.' ORDER BY id DESC LIMIT 1 FOR UPDATE',
+        'SELECT reserved_trans_no FROM '.TB_PREF.'approval_drafts WHERE trans_type='.ST_SALESORDER.' ORDER BY reserved_trans_no DESC,id DESC LIMIT 1 FOR UPDATE') as $sql){
+        $rows=db_query($sql);if(!$rows)return false;$row=db_fetch_row($rows);if($row){if(!is_numeric($row[0]) || $row[0]<0 || $row[0]>=2147483647)return false;$last=max($last,(int)$row[0]);}
+    }
+    return $last+1;
+}
+
+/** Current native labels may be held by one actual pending/approved core command. */
+function sales_order_reference_available($reference,$own_draft_id=0)
+{
+    if(empty($GLOBALS['transaction_level']) || !is_string($reference) || trim($reference)==='' || strlen($reference)>100)return false;
+    foreach(array('SELECT order_no FROM '.TB_PREF.'sales_orders WHERE trans_type='.ST_SALESORDER.' AND reference='.db_escape($reference).' ORDER BY order_no FOR UPDATE',
+        'SELECT id FROM '.TB_PREF.'approval_drafts WHERE trans_type='.ST_SALESORDER.' AND status IN (0,1) AND reference='.db_escape($reference).' AND id<>'.(int)$own_draft_id.' ORDER BY id FOR UPDATE') as $sql){$rows=db_query($sql);if(!$rows || db_num_rows($rows))return false;}
+    return true;
 }

@@ -300,7 +300,7 @@ function get_posted_rfq_response_lines($rfq_vendor_id)
 function get_bridge_requisition_supplier_options($requisition_id)
 {
 	$options = array();
-	if ((int)$requisition_id <= 0)
+	if ((int)$requisition_id <= 0 || !$_SESSION['wa_current_user']->can_access('SA_PURCHREQUISITION'))
 		return $options;
 
 	$lines = get_requisition_lines($requisition_id);
@@ -323,19 +323,25 @@ if (isset($_GET['New']))
 
 $bridge_requisition_id = (int)get_post('bridge_requisition_id', isset($_GET['requisition_id']) ? (int)$_GET['requisition_id'] : 0);
 
-if (isset($_POST['CreateFromRequisition'])) {
-	$bridge_supplier_ids = array();
-	if (!empty($_POST['bridge_supplier_id']) && is_array($_POST['bridge_supplier_id'])) {
-		foreach ($_POST['bridge_supplier_id'] as $supplier_id) {
-			if ((int)$supplier_id > 0)
-				$bridge_supplier_ids[] = (int)$supplier_id;
-		}
-	}
+/** Bind a bridge form to its rendering actor, company and connection configuration. */
+function get_purch_rfq_requisition_form_context()
+{
+	global $db_connections;
+	$user = $_SESSION['wa_current_user'];
+	return hash_hmac('sha256', serialize(array($user->user, $user->cur_con,
+		$db_connections[$user->cur_con])), ensure_csrf_token());
+}
 
-	if ($bridge_requisition_id <= 0) {
+if (isset($_POST['CreateFromRequisition'])) {
+	$bridge_supplier_ids = isset($_POST['bridge_supplier_id']) ? $_POST['bridge_supplier_id'] : array();
+
+	$bridge_context = get_post('bridge_context', '');
+	if (!is_string($bridge_context) || !hash_equals(get_purch_rfq_requisition_form_context(), $bridge_context)) {
+		display_error(_('The requisition form context has changed. Reload this page before creating an RFQ.'));
+	} elseif ($bridge_requisition_id <= 0) {
 		display_error(_('Enter a valid requisition ID to bridge.'));
 	} else {
-		$created_rfq_id = create_rfq_from_requisition($bridge_requisition_id, $bridge_supplier_ids);
+		$created_rfq_id = create_rfq_from_requisition(get_post('bridge_requisition_id', $bridge_requisition_id), $bridge_supplier_ids);
 		if ($created_rfq_id) {
 			meta_forward($_SERVER['PHP_SELF'], 'rfq_id=' . $created_rfq_id . get_sel_app_param());
 		} else {
@@ -344,7 +350,8 @@ if (isset($_POST['CreateFromRequisition'])) {
 	}
 }
 
-if ((isset($_POST['ADD_RFQ']) || isset($_POST['UPDATE_RFQ'])) && can_save_purchase_rfq_header()) {
+$rfq_header_save_failed = isset($_POST['ADD_RFQ']) || isset($_POST['UPDATE_RFQ']);
+if ($rfq_header_save_failed && can_save_purchase_rfq_header()) {
 	$created_date = date2sql(get_post('created_date'));
 	$deadline_date = get_post('deadline_date') !== '' ? date2sql(get_post('deadline_date')) : null;
 	$validity_date = get_post('validity_date') !== '' ? date2sql(get_post('validity_date')) : null;
@@ -356,8 +363,8 @@ if ((isset($_POST['ADD_RFQ']) || isset($_POST['UPDATE_RFQ'])) && can_save_purcha
 	$terms_and_conditions = trim(get_post('terms_and_conditions'));
 	$delivery_location = get_post('delivery_location') === ALL_TEXT ? '' : get_post('delivery_location');
 	$evaluation_criteria = trim(get_post('evaluation_criteria'));
-	$dimension_id = (int)get_post('dimension_id');
-	$dimension2_id = (int)get_post('dimension2_id');
+	$dimension_id = get_post('dimension_id');
+	$dimension2_id = get_post('dimension2_id');
 	$reference = trim(get_post('reference'));
 	$rfq_error_message = '';
 
@@ -382,6 +389,7 @@ if ((isset($_POST['ADD_RFQ']) || isset($_POST['UPDATE_RFQ'])) && can_save_purcha
 		);
 
 		if ($selected_id) {
+			$rfq_header_save_failed = false;
 			display_notification(_('Purchase RFQ has been created.'));
 			meta_forward($_SERVER['PHP_SELF'], 'rfq_id=' . $selected_id . get_sel_app_param());
 		} else {
@@ -404,9 +412,10 @@ if ((isset($_POST['ADD_RFQ']) || isset($_POST['UPDATE_RFQ'])) && can_save_purcha
 			$dimension2_id,
 			$reference,
 			$created_date,
-			array(),
+			null,
 			$rfq_error_message
 		)) {
+			$rfq_header_save_failed = false;
 			display_notification(_('Purchase RFQ has been updated.'));
 		} else {
 			display_error($rfq_error_message !== '' ? $rfq_error_message : _('The purchase RFQ could not be updated.'));
@@ -449,7 +458,7 @@ if ($update_item_id > 0 && $selected_id > 0 && can_save_purchase_rfq_item_update
 		trim(get_post('edit_rfq_description_' . $update_item_id)),
 		trim(get_post('edit_rfq_uom_' . $update_item_id)),
 		0,
-		array(),
+		null,
 		$item_error_message
 	);
 
@@ -511,7 +520,7 @@ if ($record_vendor_response_id > 0 && $selected_id > 0 && can_save_purchase_rfq_
 			(int)get_post('response_vendor_lead_' . $record_vendor_response_id),
 			trim(get_post('response_vendor_notes_' . $record_vendor_response_id)),
 			trim(get_post('response_payment_terms_' . $record_vendor_response_id)),
-			array(),
+			null,
 			$response_error_message
 		);
 
@@ -532,8 +541,11 @@ if (isset($_POST['SendRFQ']) && $selected_id > 0) {
 
 $create_po_vendor_id = find_submit('CreatePOFromVendor');
 if ($create_po_vendor_id > 0 && $selected_id > 0) {
-	$po_number = create_po_from_rfq($selected_id, $create_po_vendor_id);
-	if ($po_number) {
+	$result = submit_rfq_purchase_order($selected_id, $create_po_vendor_id);
+	if ($result && $result['status'] === 'pending') {
+		display_notification(_('Purchase order submitted for approval.'));
+	} elseif ($result && $result['status'] === 'posted') {
+		$po_number = $result['trans_no'];
 		display_notification(_('Purchase order has been created from the awarded RFQ vendor.'));
 		display_note(get_trans_view_str(ST_PURCHORDER, $po_number, _('View Purchase Order') . ' #' . $po_number), 0, 1);
 	} else {
@@ -559,10 +571,11 @@ if ($rfq) {
 		$rfq_vendors[] = $rfq_vendor;
 }
 
-$bridge_requisition = $bridge_requisition_id > 0 ? get_purch_requisition($bridge_requisition_id) : false;
+$bridge_requisition = $bridge_requisition_id > 0 && $_SESSION['wa_current_user']->can_access('SA_PURCHREQUISITION')
+	? get_purch_requisition($bridge_requisition_id) : false;
 $bridge_supplier_options = $bridge_requisition ? get_bridge_requisition_supplier_options($bridge_requisition_id) : array();
 
-if ($rfq) {
+if ($rfq && !$rfq_header_save_failed) {
 	$_POST['created_date'] = sql2date($rfq['created_date']);
 	$_POST['deadline_date'] = $rfq['deadline_date'] ? sql2date($rfq['deadline_date']) : '';
 	$_POST['validity_date'] = $rfq['validity_date'] ? sql2date($rfq['validity_date']) : '';
@@ -627,6 +640,7 @@ if (!$rfq) {
 
 	display_heading(_('Create from Approved Requisition'));
 	start_table(TABLESTYLE2, "width='60%'");
+	hidden('bridge_context', get_purch_rfq_requisition_form_context());
 	text_row(_('Requisition ID:'), 'bridge_requisition_id', $bridge_requisition_id ? $bridge_requisition_id : null, 10, 10);
 	if ($bridge_requisition) {
 		label_row(_('Requisition Reference:'), $bridge_requisition['reference']);

@@ -10,7 +10,10 @@
 	See the License here <http://www.gnu.org/licenses/gpl-3.0.html>.
 ***********************************************************************/
 
+require_once __DIR__.'/../../../dimensions/includes/dimension_reference_writer_fence.inc';
 include_once($path_to_root . '/includes/date_functions.inc');
+include_once(__DIR__.'/purch_agreement_po_approval_db.inc');
+include_once(__DIR__.'/purch_rfq_po_approval_db.inc');
 include_once($path_to_root . '/includes/hooks.inc');
 include_once($path_to_root . '/includes/inventory.inc');
 include_once($path_to_root . '/purchasing/includes/db/purch_requisition_db.inc');
@@ -362,15 +365,14 @@ function normalize_purch_rfq_response_lines($item_rows, $lines, &$normalized_lin
 	$normalized_lines = array();
 
 	foreach ((array)$lines as $line) {
-		$rfq_item_id = isset($line['rfq_item_id']) ? (int)$line['rfq_item_id'] : 0;
-		if ($rfq_item_id <= 0 || !isset($item_rows[$rfq_item_id]))
-			continue;
+		$rfq_item_id = isset($line['rfq_item_id']) ? dimension_writer_reference_id($line['rfq_item_id']) : 0;
+		if ($rfq_item_id <= 0 || !isset($item_rows[$rfq_item_id])) return false;
 
 		$quoted_price_value = isset($line['quoted_price']) ? trim((string)$line['quoted_price']) : '';
 		$quoted_quantity_value = isset($line['quoted_quantity']) ? trim((string)$line['quoted_quantity']) : '';
 		$lead_days_value = isset($line['delivery_lead_days']) ? trim((string)$line['delivery_lead_days']) : '';
 		$line_notes = isset($line['notes']) ? trim((string)$line['notes']) : '';
-		$line_custom_data = isset($line['custom_data']) ? $line['custom_data'] : array();
+		$line_custom_data = array_key_exists('custom_data', $line) ? $line['custom_data'] : null;
 
 		if ($quoted_price_value === '')
 			$quoted_price = 0;
@@ -396,7 +398,7 @@ function normalize_purch_rfq_response_lines($item_rows, $lines, &$normalized_lin
 		} else
 			$line_lead_days = (int)$lead_days_value;
 
-		if ($quoted_price < 0) {
+		if (!is_finite($quoted_price) || !is_finite($quoted_quantity) || $quoted_price < 0) {
 			$error_message = _('Each quoted price must be zero or greater.');
 			return false;
 		}
@@ -479,26 +481,23 @@ function get_purch_rfq_award_map($custom_data)
  *
  * @param int   $rfq_id
  * @param array $award_map
- * @return void
+ * @return bool
  */
 function update_purch_rfq_award_map($rfq_id, $award_map)
 {
-	$rfq = get_purch_rfq($rfq_id);
-	if (!$rfq)
-		return;
-
-	$custom_data = decode_purch_rfq_custom_data($rfq['custom_data']);
-	$custom_data['line_awards'] = array();
-
-	foreach ($award_map as $rfq_item_id => $rfq_vendor_id) {
-		if ((int)$rfq_item_id > 0 && (int)$rfq_vendor_id > 0)
-			$custom_data['line_awards'][(int)$rfq_item_id] = (int)$rfq_vendor_id;
-	}
-
-	$sql = "UPDATE " . TB_PREF . "purch_rfq SET
-		custom_data = " . sql_purch_rfq_custom_data($custom_data) . "
-		WHERE id = " . (int)$rfq_id;
-	db_query($sql, 'could not update RFQ award map');
+	return dimension_ordinary_master_write('purch_rfq', $rfq_id, array(), function($next) use ($rfq_id, $award_map) {
+		$rows = db_query('SELECT custom_data FROM '.TB_PREF.'purch_rfq WHERE id='.(int)$rfq_id.' FOR UPDATE');
+		$row = $rows ? db_fetch($rows) : false;
+		if (!$row || !is_array($award_map)) return false;
+		$custom_data = decode_purch_rfq_custom_data($row['custom_data']);
+		$custom_data['line_awards'] = array();
+		foreach ($award_map as $rfq_item_id=>$rfq_vendor_id)
+			if ((int)$rfq_item_id > 0 && (int)$rfq_vendor_id > 0)
+				$custom_data['line_awards'][(int)$rfq_item_id] = (int)$rfq_vendor_id;
+		$encoded = encode_purch_rfq_custom_data($custom_data);
+		if ($encoded === null || dimension_master_payload_transition($row['custom_data'], $encoded) === false) return false;
+		return db_query('UPDATE '.TB_PREF.'purch_rfq SET custom_data='.sql_purch_rfq_custom_data($encoded).' WHERE id='.(int)$rfq_id);
+	}, true);
 }
 
 /**
@@ -601,100 +600,114 @@ function add_purch_rfq($rfq_type, $description, $deadline_date, $requisition_id,
 	$dimension_id = 0, $dimension2_id = 0, $reference = '', $created_date = null,
 	$custom_data = array(), &$error_message = null)
 {
-	$error_message = null;
-	$rfq_type = trim((string)$rfq_type) !== '' ? trim((string)$rfq_type) : 'standard';
-	$description = trim((string)$description);
-	$notes = trim((string)$notes);
-	$terms_and_conditions = trim((string)$terms_and_conditions);
-	$delivery_location = trim((string)$delivery_location);
-	$evaluation_criteria = trim((string)$evaluation_criteria);
-	$reference = trim((string)$reference);
-	$created_date = $created_date ? trim((string)$created_date) : date2sql(Today());
-	$deadline_date = $deadline_date ? trim((string)$deadline_date) : '';
-	$validity_date = $validity_date ? trim((string)$validity_date) : '';
-	$required_delivery_date = $required_delivery_date ? trim((string)$required_delivery_date) : '';
+	try {
+		if (!begin_transaction()) return false;
+		$error_message = '';
+		$rfq_type = trim((string)$rfq_type) !== '' ? trim((string)$rfq_type) : 'standard';
+		$description = trim((string)$description);
+		$notes = trim((string)$notes);
+		$terms_and_conditions = trim((string)$terms_and_conditions);
+		$delivery_location = trim((string)$delivery_location);
+		$evaluation_criteria = trim((string)$evaluation_criteria);
+		$reference = trim((string)$reference);
+		$created_date = $created_date ? trim((string)$created_date) : date2sql(Today());
+		$deadline_date = $deadline_date ? trim((string)$deadline_date) : '';
+		$validity_date = $validity_date ? trim((string)$validity_date) : '';
+		$required_delivery_date = $required_delivery_date ? trim((string)$required_delivery_date) : '';
 
-	if ($deadline_date === '' && is_valid_purch_rfq_sql_date($created_date))
-		$deadline_date = get_default_purch_rfq_deadline_date($created_date);
+		if ($deadline_date === '' && is_valid_purch_rfq_sql_date($created_date))
+			$deadline_date = get_default_purch_rfq_deadline_date($created_date);
 
-	if (!can_save_purch_rfq_header_data(
-		$description,
-		$created_date,
-		$deadline_date,
-		$validity_date,
-		$required_delivery_date,
-		$error_message
-	))
-		return false;
+		if (!can_save_purch_rfq_header_data(
+			$description,
+			$created_date,
+			$deadline_date,
+			$validity_date,
+			$required_delivery_date,
+			$error_message
+		))
+			{ cancel_transaction(); return false; }
 
-	$hook_data = array(
-		'rfq_type' => $rfq_type,
-		'description' => $description,
-		'deadline_date' => $deadline_date !== '' ? $deadline_date : null,
-		'requisition_id' => (int)$requisition_id,
-		'notes' => $notes,
-		'terms_and_conditions' => $terms_and_conditions,
-		'delivery_location' => $delivery_location,
-		'required_delivery_date' => $required_delivery_date !== '' ? $required_delivery_date : null,
-		'evaluation_criteria' => $evaluation_criteria,
-		'validity_date' => $validity_date !== '' ? $validity_date : null,
-		'dimension_id' => (int)$dimension_id,
-		'dimension2_id' => (int)$dimension2_id,
-		'reference' => $reference,
-		'created_date' => $created_date,
-		'created_by' => (int)$_SESSION['wa_current_user']->user,
-		'custom_data' => $custom_data,
-	);
-	hook_invoke_all('purch_rfq_before_save', $hook_data);
+		$hook_data = array(
+			'rfq_type' => $rfq_type,
+			'description' => $description,
+			'deadline_date' => $deadline_date !== '' ? $deadline_date : null,
+			'requisition_id' => (int)$requisition_id,
+			'notes' => $notes,
+			'terms_and_conditions' => $terms_and_conditions,
+			'delivery_location' => $delivery_location,
+			'required_delivery_date' => $required_delivery_date !== '' ? $required_delivery_date : null,
+			'evaluation_criteria' => $evaluation_criteria,
+			'validity_date' => $validity_date !== '' ? $validity_date : null,
+			'dimension_id' => $dimension_id,
+			'dimension2_id' => $dimension2_id,
+			'reference' => $reference,
+			'created_date' => $created_date,
+			'created_by' => (int)$_SESSION['wa_current_user']->user,
+			'custom_data' => $custom_data,
+		);
+		hook_invoke_all('purch_rfq_before_save', $hook_data);
+		$encoded = encode_purch_rfq_custom_data($hook_data['custom_data']);
+		if ($encoded === null && !in_array($hook_data['custom_data'], array(null, '', array()), true)) { cancel_transaction(); return false; }
+		$next = array('dimension_id'=>$hook_data['dimension_id'], 'dimension2_id'=>$hook_data['dimension2_id'], 'custom_data'=>$encoded);
+		$result = dimension_ordinary_master_write('purch_rfq', null, $next, function($admitted) use ($hook_data) {
+			$hook_data['dimension_id'] = $admitted['dimension_id'];
+			$hook_data['dimension2_id'] = $admitted['dimension2_id'];
 
-	$sql = "INSERT INTO " . TB_PREF . "purch_rfq (
-		reference,
-		rfq_type,
-		status,
-		created_by,
-		created_date,
-		deadline_date,
-		validity_date,
-		requisition_id,
-		description,
-		notes,
-		terms_and_conditions,
-		delivery_location,
-		required_delivery_date,
-		evaluation_criteria,
-		dimension_id,
-		dimension2_id,
-		custom_data
-	) VALUES (
-		'',
-		" . db_escape($hook_data['rfq_type']) . ",
-		'draft',
-		" . (int)$hook_data['created_by'] . ",
-		" . db_escape($hook_data['created_date']) . ",
-		" . ($hook_data['deadline_date'] ? db_escape($hook_data['deadline_date']) : 'NULL') . ",
-		" . ($hook_data['validity_date'] ? db_escape($hook_data['validity_date']) : 'NULL') . ",
-		" . (int)$hook_data['requisition_id'] . ",
-		" . ($hook_data['description'] !== '' ? db_escape($hook_data['description']) : 'NULL') . ",
-		" . ($hook_data['notes'] !== '' ? db_escape($hook_data['notes']) : 'NULL') . ",
-		" . ($hook_data['terms_and_conditions'] !== '' ? db_escape($hook_data['terms_and_conditions']) : 'NULL') . ",
-		" . db_escape($hook_data['delivery_location']) . ",
-		" . ($hook_data['required_delivery_date'] ? db_escape($hook_data['required_delivery_date']) : 'NULL') . ",
-		" . ($hook_data['evaluation_criteria'] !== '' ? db_escape($hook_data['evaluation_criteria']) : 'NULL') . ",
-		" . (int)$hook_data['dimension_id'] . ",
-		" . (int)$hook_data['dimension2_id'] . ",
-		" . sql_purch_rfq_custom_data($hook_data['custom_data']) . "
-	)";
-	db_query($sql, 'could not insert purchase RFQ');
+			$sql = "INSERT INTO " . TB_PREF . "purch_rfq (
+				reference,
+				rfq_type,
+				status,
+				created_by,
+				created_date,
+				deadline_date,
+				validity_date,
+				requisition_id,
+				description,
+				notes,
+				terms_and_conditions,
+				delivery_location,
+				required_delivery_date,
+				evaluation_criteria,
+				dimension_id,
+				dimension2_id,
+				custom_data
+			) VALUES (
+				'',
+				" . db_escape($hook_data['rfq_type']) . ",
+				'draft',
+				" . (int)$hook_data['created_by'] . ",
+				" . db_escape($hook_data['created_date']) . ",
+				" . ($hook_data['deadline_date'] ? db_escape($hook_data['deadline_date']) : 'NULL') . ",
+				" . ($hook_data['validity_date'] ? db_escape($hook_data['validity_date']) : 'NULL') . ",
+				" . (int)$hook_data['requisition_id'] . ",
+				" . ($hook_data['description'] !== '' ? db_escape($hook_data['description']) : 'NULL') . ",
+				" . ($hook_data['notes'] !== '' ? db_escape($hook_data['notes']) : 'NULL') . ",
+				" . ($hook_data['terms_and_conditions'] !== '' ? db_escape($hook_data['terms_and_conditions']) : 'NULL') . ",
+				" . db_escape($hook_data['delivery_location']) . ",
+				" . ($hook_data['required_delivery_date'] ? db_escape($hook_data['required_delivery_date']) : 'NULL') . ",
+				" . ($hook_data['evaluation_criteria'] !== '' ? db_escape($hook_data['evaluation_criteria']) : 'NULL') . ",
+				" . (int)$hook_data['dimension_id'] . ",
+				" . (int)$hook_data['dimension2_id'] . ",
+				" . sql_purch_rfq_custom_data($hook_data['custom_data']) . "
+			)";
+			if (!db_query($sql)) return false;
 
-	$rfq_id = db_insert_id();
-	$generated_reference = $hook_data['reference'] !== '' ? $hook_data['reference'] : format_purch_rfq_reference($rfq_id);
+			$rfq_id = db_insert_id();
+			$generated_reference = $hook_data['reference'] !== '' ? $hook_data['reference'] : format_purch_rfq_reference($rfq_id);
 
-	$sql = "UPDATE " . TB_PREF . "purch_rfq SET
-		reference = " . db_escape($generated_reference) . "
-		WHERE id = " . (int)$rfq_id;
-	db_query($sql, 'could not update purchase RFQ reference');
+			$sql = "UPDATE " . TB_PREF . "purch_rfq SET
+				reference = " . db_escape($generated_reference) . "
+				WHERE id = " . (int)$rfq_id;
+			if (!db_query($sql)) return false;
 
-	return $rfq_id;
+			if (!db_preserve_insert_id($rfq_id)) return false;
+			return $rfq_id;
+		});
+		if (!$result || !commit_transaction()) { cancel_transaction(); return false; }
+		return $result;
+	} catch (Exception $exception) { cancel_transaction(); return false;
+	} catch (Throwable $exception) { cancel_transaction(); return false; }
 }
 
 /**
@@ -723,80 +736,96 @@ function update_purch_rfq($rfq_id, $rfq_type, $description, $deadline_date, $req
 	$notes = '', $terms_and_conditions = '', $delivery_location = '',
 	$required_delivery_date = null, $evaluation_criteria = '', $validity_date = null,
 	$dimension_id = 0, $dimension2_id = 0, $reference = '', $created_date = null,
-	$custom_data = array(), &$error_message = null)
+	$custom_data = null, &$error_message = null)
 {
-	$error_message = null;
-	$rfq = get_editable_purch_rfq($rfq_id);
-	if (!$rfq)
-		return false;
+	try {
+		if (!begin_transaction()) return false;
+		$error_message = '';
+		if (dimension_writer_reference_id($rfq_id) === false || !$rfq_id) { cancel_transaction(); return false; }
+		$rows = db_query('SELECT * FROM '.TB_PREF.'purch_rfq WHERE id='.(int)$rfq_id.' FOR UPDATE');
+		$rfq = $rows ? db_fetch($rows) : false;
+		if (!$rfq || !in_array($rfq['status'], get_purch_rfq_editable_statuses(), true))
+			{ cancel_transaction(); return false; }
 
-	$rfq_type = trim((string)$rfq_type) !== '' ? trim((string)$rfq_type) : $rfq['rfq_type'];
-	$description = trim((string)$description);
-	$notes = trim((string)$notes);
-	$terms_and_conditions = trim((string)$terms_and_conditions);
-	$delivery_location = trim((string)$delivery_location);
-	$evaluation_criteria = trim((string)$evaluation_criteria);
-	$reference = trim((string)$reference);
-	$created_date = $created_date ? trim((string)$created_date) : $rfq['created_date'];
-	$deadline_date = $deadline_date ? trim((string)$deadline_date) : '';
-	$validity_date = $validity_date ? trim((string)$validity_date) : '';
-	$required_delivery_date = $required_delivery_date ? trim((string)$required_delivery_date) : '';
+		$rfq_type = trim((string)$rfq_type) !== '' ? trim((string)$rfq_type) : $rfq['rfq_type'];
+		$description = trim((string)$description);
+		$notes = trim((string)$notes);
+		$terms_and_conditions = trim((string)$terms_and_conditions);
+		$delivery_location = trim((string)$delivery_location);
+		$evaluation_criteria = trim((string)$evaluation_criteria);
+		$reference = trim((string)$reference);
+		$created_date = $created_date ? trim((string)$created_date) : $rfq['created_date'];
+		$deadline_date = $deadline_date ? trim((string)$deadline_date) : '';
+		$validity_date = $validity_date ? trim((string)$validity_date) : '';
+		$required_delivery_date = $required_delivery_date ? trim((string)$required_delivery_date) : '';
 
-	if ($deadline_date === '' && is_valid_purch_rfq_sql_date($created_date))
-		$deadline_date = get_default_purch_rfq_deadline_date($created_date);
-	if ($reference === '')
-		$reference = $rfq['reference'];
+		if ($deadline_date === '' && is_valid_purch_rfq_sql_date($created_date))
+			$deadline_date = get_default_purch_rfq_deadline_date($created_date);
+		if ($reference === '')
+			$reference = $rfq['reference'];
 
-	if (!can_save_purch_rfq_header_data(
-		$description,
-		$created_date,
-		$deadline_date,
-		$validity_date,
-		$required_delivery_date,
-		$error_message
-	))
-		return false;
+		if (!can_save_purch_rfq_header_data(
+			$description,
+			$created_date,
+			$deadline_date,
+			$validity_date,
+			$required_delivery_date,
+			$error_message
+		))
+			{ cancel_transaction(); return false; }
 
-	$hook_data = array(
-		'id' => (int)$rfq_id,
-		'rfq_type' => $rfq_type,
-		'description' => $description,
-		'deadline_date' => $deadline_date !== '' ? $deadline_date : null,
-		'requisition_id' => (int)$requisition_id,
-		'notes' => $notes,
-		'terms_and_conditions' => $terms_and_conditions,
-		'delivery_location' => $delivery_location,
-		'required_delivery_date' => $required_delivery_date !== '' ? $required_delivery_date : null,
-		'evaluation_criteria' => $evaluation_criteria,
-		'validity_date' => $validity_date !== '' ? $validity_date : null,
-		'dimension_id' => (int)$dimension_id,
-		'dimension2_id' => (int)$dimension2_id,
-		'reference' => $reference,
-		'created_date' => $created_date,
-		'custom_data' => $custom_data,
-	);
-	hook_invoke_all('purch_rfq_before_save', $hook_data);
+		if ($custom_data === null) $custom_data = $rfq['custom_data'];
+		$hook_data = array(
+			'id' => (int)$rfq_id,
+			'rfq_type' => $rfq_type,
+			'description' => $description,
+			'deadline_date' => $deadline_date !== '' ? $deadline_date : null,
+			'requisition_id' => (int)$requisition_id,
+			'notes' => $notes,
+			'terms_and_conditions' => $terms_and_conditions,
+			'delivery_location' => $delivery_location,
+			'required_delivery_date' => $required_delivery_date !== '' ? $required_delivery_date : null,
+			'evaluation_criteria' => $evaluation_criteria,
+			'validity_date' => $validity_date !== '' ? $validity_date : null,
+			'dimension_id' => $dimension_id,
+			'dimension2_id' => $dimension2_id,
+			'reference' => $reference,
+			'created_date' => $created_date,
+			'custom_data' => $custom_data,
+		);
+		hook_invoke_all('purch_rfq_before_save', $hook_data);
+		$encoded = encode_purch_rfq_custom_data($hook_data['custom_data']);
+		if ($encoded === null && !in_array($hook_data['custom_data'], array(null, '', array()), true)) { cancel_transaction(); return false; }
+		$next = array('dimension_id'=>$hook_data['dimension_id'], 'dimension2_id'=>$hook_data['dimension2_id'], 'custom_data'=>$encoded);
+		$result = dimension_ordinary_master_write('purch_rfq', $rfq_id, $next, function($admitted) use ($hook_data, $rfq_id) {
+			$hook_data['dimension_id'] = $admitted['dimension_id'];
+			$hook_data['dimension2_id'] = $admitted['dimension2_id'];
 
-	$sql = "UPDATE " . TB_PREF . "purch_rfq SET
-		rfq_type = " . db_escape($hook_data['rfq_type']) . ",
-		created_date = " . db_escape($hook_data['created_date']) . ",
-		deadline_date = " . ($hook_data['deadline_date'] ? db_escape($hook_data['deadline_date']) : 'NULL') . ",
-		validity_date = " . ($hook_data['validity_date'] ? db_escape($hook_data['validity_date']) : 'NULL') . ",
-		requisition_id = " . (int)$hook_data['requisition_id'] . ",
-		description = " . ($hook_data['description'] !== '' ? db_escape($hook_data['description']) : 'NULL') . ",
-		notes = " . ($hook_data['notes'] !== '' ? db_escape($hook_data['notes']) : 'NULL') . ",
-		terms_and_conditions = " . ($hook_data['terms_and_conditions'] !== '' ? db_escape($hook_data['terms_and_conditions']) : 'NULL') . ",
-		delivery_location = " . db_escape($hook_data['delivery_location']) . ",
-		required_delivery_date = " . ($hook_data['required_delivery_date'] ? db_escape($hook_data['required_delivery_date']) : 'NULL') . ",
-		evaluation_criteria = " . ($hook_data['evaluation_criteria'] !== '' ? db_escape($hook_data['evaluation_criteria']) : 'NULL') . ",
-		dimension_id = " . (int)$hook_data['dimension_id'] . ",
-		dimension2_id = " . (int)$hook_data['dimension2_id'] . ",
-		reference = " . db_escape($hook_data['reference']) . ",
-		custom_data = " . sql_purch_rfq_custom_data($hook_data['custom_data']) . "
-		WHERE id = " . (int)$rfq_id;
-	db_query($sql, 'could not update purchase RFQ');
+			$sql = "UPDATE " . TB_PREF . "purch_rfq SET
+				rfq_type = " . db_escape($hook_data['rfq_type']) . ",
+				created_date = " . db_escape($hook_data['created_date']) . ",
+				deadline_date = " . ($hook_data['deadline_date'] ? db_escape($hook_data['deadline_date']) : 'NULL') . ",
+				validity_date = " . ($hook_data['validity_date'] ? db_escape($hook_data['validity_date']) : 'NULL') . ",
+				requisition_id = " . (int)$hook_data['requisition_id'] . ",
+				description = " . ($hook_data['description'] !== '' ? db_escape($hook_data['description']) : 'NULL') . ",
+				notes = " . ($hook_data['notes'] !== '' ? db_escape($hook_data['notes']) : 'NULL') . ",
+				terms_and_conditions = " . ($hook_data['terms_and_conditions'] !== '' ? db_escape($hook_data['terms_and_conditions']) : 'NULL') . ",
+				delivery_location = " . db_escape($hook_data['delivery_location']) . ",
+				required_delivery_date = " . ($hook_data['required_delivery_date'] ? db_escape($hook_data['required_delivery_date']) : 'NULL') . ",
+				evaluation_criteria = " . ($hook_data['evaluation_criteria'] !== '' ? db_escape($hook_data['evaluation_criteria']) : 'NULL') . ",
+				dimension_id = " . (int)$hook_data['dimension_id'] . ",
+				dimension2_id = " . (int)$hook_data['dimension2_id'] . ",
+				reference = " . db_escape($hook_data['reference']) . ",
+				custom_data = " . sql_purch_rfq_custom_data($hook_data['custom_data']) . "
+				WHERE id = " . (int)$rfq_id;
+			if (!db_query($sql)) return false;
 
-	return true;
+			return true;
+		});
+		if (!$result || !commit_transaction()) { cancel_transaction(); return false; }
+		return $result;
+	} catch (Exception $exception) { cancel_transaction(); return false;
+	} catch (Throwable $exception) { cancel_transaction(); return false; }
 }
 
 /**
@@ -807,29 +836,31 @@ function update_purch_rfq($rfq_id, $rfq_type, $description, $deadline_date, $req
  */
 function delete_purch_rfq($rfq_id)
 {
-	$rfq = get_purch_rfq($rfq_id);
-	if (!$rfq || $rfq['status'] !== 'draft')
-		return false;
-
-	begin_transaction();
-
-	$sql = "DELETE rfq_vendor_line
-		FROM " . TB_PREF . "purch_rfq_vendor_lines rfq_vendor_line
-		INNER JOIN " . TB_PREF . "purch_rfq_vendors rfq_vendor ON rfq_vendor.id = rfq_vendor_line.rfq_vendor_id
-		WHERE rfq_vendor.rfq_id = " . (int)$rfq_id;
-	db_query($sql, 'could not delete RFQ vendor lines');
-
-	$sql = "DELETE FROM " . TB_PREF . "purch_rfq_vendors WHERE rfq_id = " . (int)$rfq_id;
-	db_query($sql, 'could not delete RFQ vendors');
-
-	$sql = "DELETE FROM " . TB_PREF . "purch_rfq_items WHERE rfq_id = " . (int)$rfq_id;
-	db_query($sql, 'could not delete RFQ items');
-
-	$sql = "DELETE FROM " . TB_PREF . "purch_rfq WHERE id = " . (int)$rfq_id;
-	db_query($sql, 'could not delete RFQ');
-
-	commit_transaction();
-	return true;
+	return dimension_ordinary_master_write('purch_rfq', $rfq_id,
+		array('dimension_id'=>0, 'dimension2_id'=>0), function($next) use ($rfq_id) {
+		$rows = db_query('SELECT status FROM '.TB_PREF.'purch_rfq WHERE id='.(int)$rfq_id.' FOR UPDATE');
+		$rfq = $rows ? db_fetch($rows) : false;
+		if (!$rfq || $rfq['status'] !== 'draft') return false;
+		// Lock every exact cascade target before erasing any retained evidence.
+		$targets = array(
+			'SELECT l.custom_data FROM '.TB_PREF.'purch_rfq_vendor_lines l INNER JOIN '.TB_PREF.'purch_rfq_vendors v ON v.id=l.rfq_vendor_id WHERE v.rfq_id='.(int)$rfq_id,
+			'SELECT custom_data FROM '.TB_PREF.'purch_rfq_vendors WHERE rfq_id='.(int)$rfq_id,
+			'SELECT custom_data FROM '.TB_PREF.'purch_rfq_items WHERE rfq_id='.(int)$rfq_id);
+		foreach ($targets as $sql) {
+			$rows = db_query($sql.' FOR UPDATE');
+			if (!$rows) return false;
+			while ($row = db_fetch($rows))
+				if (!array_key_exists('custom_data', $row)
+					|| dimension_master_payload_transition($row['custom_data'], null, true) === false) return false;
+		}
+		$deletes = array(
+			'DELETE l FROM '.TB_PREF.'purch_rfq_vendor_lines l INNER JOIN '.TB_PREF.'purch_rfq_vendors v ON v.id=l.rfq_vendor_id WHERE v.rfq_id='.(int)$rfq_id,
+			'DELETE FROM '.TB_PREF.'purch_rfq_vendors WHERE rfq_id='.(int)$rfq_id,
+			'DELETE FROM '.TB_PREF.'purch_rfq_items WHERE rfq_id='.(int)$rfq_id,
+			'DELETE FROM '.TB_PREF.'purch_rfq WHERE id='.(int)$rfq_id);
+		foreach ($deletes as $sql) if (!db_query($sql)) return false;
+		return true;
+	}, false, true);
 }
 
 /**
@@ -867,59 +898,65 @@ function get_next_purch_rfq_item_sort_order($rfq_id)
 function add_rfq_item($rfq_id, $stock_id, $quantity, $target_price, $specifications = '',
 	$description = '', $unit_of_measure = '', $sort_order = 0, $custom_data = array(), &$error_message = null)
 {
-	$error_message = null;
-	$stock_id = trim((string)$stock_id);
-	$specifications = trim((string)$specifications);
-	$description = trim((string)$description);
-	$unit_of_measure = trim((string)$unit_of_measure);
+	$encoded = encode_purch_rfq_custom_data($custom_data);
+	if ($encoded === null && !in_array($custom_data, array(null, '', array()), true)) return false;
+	return dimension_rfq_child_write('purch_rfq_items', null,
+		array('rfq_id'=>$rfq_id, 'custom_data'=>$encoded), function($admitted) use ($rfq_id, $stock_id, $quantity, $target_price, $specifications, $description, $unit_of_measure, $sort_order, $custom_data, &$error_message) {
 
-	$rfq = get_editable_purch_rfq($rfq_id);
-	if (!$rfq) {
-		$existing_rfq = get_purch_rfq($rfq_id);
-		if (!$existing_rfq)
-			$error_message = _('The selected RFQ could not be found.');
-		else
-			$error_message = _('Items can only be added while the RFQ is in Draft status.');
-		return false;
-	}
+		$error_message = '';
+		$stock_id = trim((string)$stock_id);
+		$specifications = trim((string)$specifications);
+		$description = trim((string)$description);
+		$unit_of_measure = trim((string)$unit_of_measure);
 
-	if (!can_save_purch_rfq_item_data($stock_id, $quantity, $target_price, $error_message))
-		return false;
+		$rfq = get_editable_purch_rfq($rfq_id);
+		if (!$rfq) {
+			$existing_rfq = get_purch_rfq($rfq_id);
+			if (!$existing_rfq)
+				$error_message = _('The selected RFQ could not be found.');
+			else
+				$error_message = _('Items can only be added while the RFQ is in Draft status.');
+			return false;
+		}
 
-	$item = stock_master_entity::find($stock_id);
-	if (!$item) {
-		$error_message = _('The selected item could not be found.');
-		return false;
-	}
+		if (!can_save_purch_rfq_item_data($stock_id, $quantity, $target_price, $error_message))
+			return false;
 
-	$line_description = $description !== '' ? $description : $item['description'];
-	$line_unit = $unit_of_measure !== '' ? $unit_of_measure : $item['units'];
-	$sort_order = $sort_order > 0 ? (int)$sort_order : get_next_purch_rfq_item_sort_order($rfq_id);
+		$item = stock_master_entity::find($stock_id);
+		if (!$item) {
+			$error_message = _('The selected item could not be found.');
+			return false;
+		}
 
-	$sql = "INSERT INTO " . TB_PREF . "purch_rfq_items (
-		rfq_id,
-		stock_id,
-		description,
-		quantity,
-		unit_of_measure,
-		target_price,
-		specifications,
-		sort_order,
-		custom_data
-	) VALUES (
-		" . (int)$rfq_id . ",
-		" . db_escape($stock_id) . ",
-		" . db_escape($line_description) . ",
-		" . db_escape($quantity) . ",
-		" . db_escape($line_unit) . ",
-		" . db_escape($target_price) . ",
-		" . ($specifications !== '' ? db_escape($specifications) : 'NULL') . ",
-		" . (int)$sort_order . ",
-		" . sql_purch_rfq_custom_data($custom_data) . "
-	)";
-	db_query($sql, 'could not insert RFQ item');
+		$line_description = $description !== '' ? $description : $item['description'];
+		$line_unit = $unit_of_measure !== '' ? $unit_of_measure : $item['units'];
+		$sort_order = $sort_order > 0 ? (int)$sort_order : get_next_purch_rfq_item_sort_order($rfq_id);
 
-	return db_insert_id();
+		$sql = "INSERT INTO " . TB_PREF . "purch_rfq_items (
+			rfq_id,
+			stock_id,
+			description,
+			quantity,
+			unit_of_measure,
+			target_price,
+			specifications,
+			sort_order,
+			custom_data
+		) VALUES (
+			" . (int)$rfq_id . ",
+			" . db_escape($stock_id) . ",
+			" . db_escape($line_description) . ",
+			" . db_escape($quantity) . ",
+			" . db_escape($line_unit) . ",
+			" . db_escape($target_price) . ",
+			" . ($specifications !== '' ? db_escape($specifications) : 'NULL') . ",
+			" . (int)$sort_order . ",
+			" . sql_purch_rfq_custom_data($custom_data) . "
+		)";
+		if (!db_query($sql)) return false;
+
+		return db_insert_id();
+	});
 }
 
 /**
@@ -938,48 +975,56 @@ function add_rfq_item($rfq_id, $stock_id, $quantity, $target_price, $specificati
  * @return bool
  */
 function update_rfq_item($item_id, $stock_id, $quantity, $target_price, $specifications = '',
-	$description = '', $unit_of_measure = '', $sort_order = 0, $custom_data = array(), &$error_message = null)
+	$description = '', $unit_of_measure = '', $sort_order = 0, $custom_data = null, &$error_message = null)
 {
-	$error_message = null;
-	$stock_id = trim((string)$stock_id);
-	$specifications = trim((string)$specifications);
-	$description = trim((string)$description);
-	$unit_of_measure = trim((string)$unit_of_measure);
+	$next = array();
+	if ($custom_data !== null) {
+		$next['custom_data'] = encode_purch_rfq_custom_data($custom_data);
+		if ($next['custom_data'] === null && !in_array($custom_data, array('', array()), true)) return false;
+	}
+	return dimension_rfq_child_write('purch_rfq_items', $item_id, $next,
+		function($admitted) use ($item_id, $stock_id, $quantity, $target_price, $specifications, $description, $unit_of_measure, $sort_order, $custom_data, &$error_message) {
 
-	$sql = "SELECT * FROM " . TB_PREF . "purch_rfq_items WHERE id = " . (int)$item_id;
-	$result = db_query($sql, 'could not get RFQ item');
-	$item_row = db_fetch($result);
-	if (!$item_row)
-		return false;
+		$error_message = '';
+		$stock_id = trim((string)$stock_id);
+		$specifications = trim((string)$specifications);
+		$description = trim((string)$description);
+		$unit_of_measure = trim((string)$unit_of_measure);
 
-	$rfq = get_editable_purch_rfq((int)$item_row['rfq_id']);
-	if (!$rfq)
-		return false;
+		$sql = "SELECT * FROM " . TB_PREF . "purch_rfq_items WHERE id = " . (int)$item_id . ' FOR UPDATE';
+		$result = db_query($sql, 'could not get RFQ item');
+		$item_row = db_fetch($result);
+		if (!$item_row)
+			return false;
 
-	if (!can_save_purch_rfq_item_data($stock_id, $quantity, $target_price, $error_message))
-		return false;
+		if ($custom_data === null) $custom_data = $item_row['custom_data'];
+		$rfq = get_editable_purch_rfq((int)$item_row['rfq_id']);
+		if (!$rfq)
+			return false;
 
-	$item = stock_master_entity::find($stock_id);
-	if (!$item)
-		return false;
+		if (!can_save_purch_rfq_item_data($stock_id, $quantity, $target_price, $error_message))
+			return false;
 
-	$line_description = $description !== '' ? $description : $item['description'];
-	$line_unit = $unit_of_measure !== '' ? $unit_of_measure : $item['units'];
-	$sort_order = $sort_order > 0 ? (int)$sort_order : (int)$item_row['sort_order'];
+		$item = stock_master_entity::find($stock_id);
+		if (!$item)
+			return false;
 
-	$sql = "UPDATE " . TB_PREF . "purch_rfq_items SET
-		stock_id = " . db_escape($stock_id) . ",
-		description = " . db_escape($line_description) . ",
-		quantity = " . db_escape($quantity) . ",
-		unit_of_measure = " . db_escape($line_unit) . ",
-		target_price = " . db_escape($target_price) . ",
-		specifications = " . ($specifications !== '' ? db_escape($specifications) : 'NULL') . ",
-		sort_order = " . (int)$sort_order . ",
-		custom_data = " . sql_purch_rfq_custom_data($custom_data) . "
-		WHERE id = " . (int)$item_id;
-	db_query($sql, 'could not update RFQ item');
+		$line_description = $description !== '' ? $description : $item['description'];
+		$line_unit = $unit_of_measure !== '' ? $unit_of_measure : $item['units'];
+		$sort_order = $sort_order > 0 ? (int)$sort_order : (int)$item_row['sort_order'];
 
-	return true;
+		$sql = "UPDATE " . TB_PREF . "purch_rfq_items SET
+			stock_id = " . db_escape($stock_id) . ",
+			description = " . db_escape($line_description) . ",
+			quantity = " . db_escape($quantity) . ",
+			unit_of_measure = " . db_escape($line_unit) . ",
+			target_price = " . db_escape($target_price) . ",
+			specifications = " . ($specifications !== '' ? db_escape($specifications) : 'NULL') . ",
+			sort_order = " . (int)$sort_order . ",
+			custom_data = " . sql_purch_rfq_custom_data($custom_data) . "
+			WHERE id = " . (int)$item_id;
+		return (bool)db_query($sql);
+	});
 }
 
 /**
@@ -990,26 +1035,10 @@ function update_rfq_item($item_id, $stock_id, $quantity, $target_price, $specifi
  */
 function delete_rfq_item($item_id)
 {
-	$sql = "SELECT * FROM " . TB_PREF . "purch_rfq_items WHERE id = " . (int)$item_id;
-	$result = db_query($sql, 'could not get RFQ item for delete');
-	$item_row = db_fetch($result);
-	if (!$item_row)
-		return false;
-
-	$rfq = get_editable_purch_rfq((int)$item_row['rfq_id']);
-	if (!$rfq)
-		return false;
-
-	begin_transaction();
-
-	$sql = "DELETE FROM " . TB_PREF . "purch_rfq_vendor_lines WHERE rfq_item_id = " . (int)$item_id;
-	db_query($sql, 'could not delete RFQ vendor line responses');
-
-	$sql = "DELETE FROM " . TB_PREF . "purch_rfq_items WHERE id = " . (int)$item_id;
-	db_query($sql, 'could not delete RFQ item');
-
-	commit_transaction();
-	return true;
+	return dimension_rfq_child_write('purch_rfq_items', $item_id, array(), function($admitted) use ($item_id) {
+		if (!db_query('DELETE FROM '.TB_PREF.'purch_rfq_vendor_lines WHERE rfq_item_id='.(int)$item_id)) return false;
+		return (bool)db_query('DELETE FROM '.TB_PREF.'purch_rfq_items WHERE id='.(int)$item_id);
+	}, true);
 }
 
 /**
@@ -1113,33 +1142,41 @@ function resolve_purch_rfq_vendor_reference($rfq_id, $vendor_reference)
  */
 function add_rfq_vendor($rfq_id, $supplier_id, $custom_data = array())
 {
-	$rfq = get_editable_purch_rfq($rfq_id);
-	if (!$rfq || (int)$supplier_id <= 0)
-		return false;
+	$encoded = encode_purch_rfq_custom_data($custom_data);
+	if ($encoded === null && !in_array($custom_data, array(null, '', array()), true)) return false;
+	return dimension_rfq_child_write('purch_rfq_vendors', null,
+		array('rfq_id'=>$rfq_id, 'custom_data'=>$encoded), function($admitted) use ($rfq_id, $supplier_id, $custom_data) {
 
-	if (!suppliers_entity::find((int)$supplier_id))
-		return false;
+		$rfq = get_editable_purch_rfq($rfq_id);
+		if (!$rfq || (int)$supplier_id <= 0)
+			return false;
 
-	$existing = get_purch_rfq_vendor_by_supplier($rfq_id, $supplier_id);
-	if ($existing)
-		return (int)$existing['id'];
+		if (!suppliers_entity::find((int)$supplier_id))
+			return false;
 
-	$sql = "INSERT INTO " . TB_PREF . "purch_rfq_vendors (
-		rfq_id,
-		supplier_id,
-		status,
-		is_winner,
-		custom_data
-	) VALUES (
-		" . (int)$rfq_id . ",
-		" . (int)$supplier_id . ",
-		'invited',
-		0,
-		" . sql_purch_rfq_custom_data($custom_data) . "
-	)";
-	db_query($sql, 'could not insert RFQ vendor');
+		$existing = get_purch_rfq_vendor_by_supplier($rfq_id, $supplier_id);
+		if ($existing) {
+			if (!db_preserve_insert_id((int)$existing['id'])) return false;
+			return (int)$existing['id'];
+		}
 
-	return db_insert_id();
+		$sql = "INSERT INTO " . TB_PREF . "purch_rfq_vendors (
+			rfq_id,
+			supplier_id,
+			status,
+			is_winner,
+			custom_data
+		) VALUES (
+			" . (int)$rfq_id . ",
+			" . (int)$supplier_id . ",
+			'invited',
+			0,
+			" . sql_purch_rfq_custom_data($custom_data) . "
+		)";
+		if (!db_query($sql)) return false;
+
+		return db_insert_id();
+	});
 }
 
 /**
@@ -1151,24 +1188,20 @@ function add_rfq_vendor($rfq_id, $supplier_id, $custom_data = array())
  */
 function remove_rfq_vendor($rfq_id, $supplier_id)
 {
-	$rfq = get_editable_purch_rfq($rfq_id);
-	if (!$rfq)
-		return false;
-
-	$rfq_vendor = get_purch_rfq_vendor_by_supplier($rfq_id, $supplier_id);
-	if (!$rfq_vendor || in_array($rfq_vendor['status'], array('responded', 'awarded')) || (int)$rfq_vendor['is_winner'] === 1)
-		return false;
-
-	begin_transaction();
-
-	$sql = "DELETE FROM " . TB_PREF . "purch_rfq_vendor_lines WHERE rfq_vendor_id = " . (int)$rfq_vendor['id'];
-	db_query($sql, 'could not delete RFQ vendor response lines');
-
-	$sql = "DELETE FROM " . TB_PREF . "purch_rfq_vendors WHERE id = " . (int)$rfq_vendor['id'];
-	db_query($sql, 'could not delete RFQ vendor');
-
-	commit_transaction();
-	return true;
+	// Parent ownership is established before resolving a supplier's current row.
+	return dimension_ordinary_master_write('purch_rfq', $rfq_id, array(), function($admitted) use ($rfq_id, $supplier_id) {
+		$rows = db_query('SELECT id FROM '.TB_PREF.'purch_rfq_vendors WHERE rfq_id='.(int)$rfq_id.' AND supplier_id='.(int)$supplier_id.' FOR UPDATE');
+		$row = $rows ? db_fetch($rows) : false;
+		if (!$row) return false;
+		$vendor_id = (int)$row['id'];
+		return dimension_rfq_child_write('purch_rfq_vendors', $vendor_id, array(), function($admitted) use ($vendor_id) {
+			$rows = db_query('SELECT status, is_winner FROM '.TB_PREF.'purch_rfq_vendors WHERE id='.$vendor_id.' FOR UPDATE');
+			$vendor = $rows ? db_fetch($rows) : false;
+			if (!$vendor || in_array($vendor['status'], array('responded', 'awarded'), true) || (int)$vendor['is_winner'] === 1) return false;
+			if (!db_query('DELETE FROM '.TB_PREF.'purch_rfq_vendor_lines WHERE rfq_vendor_id='.$vendor_id)) return false;
+			return (bool)db_query('DELETE FROM '.TB_PREF.'purch_rfq_vendors WHERE id='.$vendor_id);
+		}, true);
+	}, true);
 }
 
 /**
@@ -1215,68 +1248,91 @@ function get_rfq_vendor_line_map($rfq_vendor_id)
 	return $line_map;
 }
 
+/** Preserve native supplier-join admission using a current lock, including inactive history. */
+function lock_purch_rfq_activity_supplier($supplier_id)
+{
+    $rows = db_query('SELECT supplier_id FROM '.TB_PREF.'suppliers WHERE supplier_id='.(int)$supplier_id.' FOR UPDATE');
+    return $rows && (bool)db_fetch($rows);
+}
+
+/**
+ * Own an RFQ activity command under the current parent, item and vendor locks.
+ * Native page/session authority is still required. Current locking reads defeat
+ * repeatable-read snapshots; every callback failure cancels the whole command.
+ * This is sourcing activity, not approval of a resulting purchase order.
+ */
+function write_purch_rfq_activity($rfq_id, $callback)
+{
+    return dimension_ordinary_master_write('purch_rfq', $rfq_id, array(),
+        function($admitted) use ($rfq_id, $callback) {
+            $rows = db_query('SELECT * FROM '.TB_PREF.'purch_rfq WHERE id='.(int)$rfq_id.' FOR UPDATE');
+            $rfq = $rows ? db_fetch($rows) : false;
+            if (!$rfq || !in_array($rfq['status'], array('draft','sent','received','evaluated'), true)) return false;
+            $items = array(); $vendors = array();
+            $rows = db_query('SELECT * FROM '.TB_PREF.'purch_rfq_items WHERE rfq_id='.(int)$rfq_id.' ORDER BY id FOR UPDATE');
+            if (!$rows) return false;
+            while ($row = db_fetch($rows)) $items[(int)$row['id']] = $row;
+            $rows = db_query('SELECT * FROM '.TB_PREF.'purch_rfq_vendors WHERE rfq_id='.(int)$rfq_id.' ORDER BY id FOR UPDATE');
+            if (!$rows) return false;
+            while ($row = db_fetch($rows)) $vendors[(int)$row['id']] = $row;
+            return call_user_func($callback, $rfq, $items, $vendors);
+        }, true);
+}
+
+/** Resolve a vendor parent hint, then recheck the exact identity under its lock. */
+function write_purch_rfq_vendor_activity($vendor_id, $callback)
+{
+    $vendor_id = dimension_writer_reference_id($vendor_id);
+    if (!$vendor_id) return false;
+    $rows = db_query('SELECT rfq_id FROM '.TB_PREF.'purch_rfq_vendors WHERE id='.$vendor_id);
+    $hint = $rows ? db_fetch($rows) : false;
+    if (!$hint) return false;
+    return write_purch_rfq_activity($hint['rfq_id'], function($rfq, $items, $vendors) use ($vendor_id, $callback) {
+        if (!isset($vendors[$vendor_id]) || !lock_purch_rfq_activity_supplier($vendors[$vendor_id]['supplier_id'])) return false;
+        return dimension_ordinary_master_write('purch_rfq_vendors', $vendor_id, array(),
+            function($admitted) use ($rfq, $items, $vendors, $vendor_id, $callback) {
+                return call_user_func($callback, $rfq, $items, $vendors[$vendor_id]);
+            }, true);
+    });
+}
+
 /**
  * Refresh one RFQ vendor total from line responses.
  *
  * @param int $rfq_vendor_id
- * @return float
+ * @return float|false
  */
 function refresh_purch_rfq_vendor_total($rfq_vendor_id)
 {
-	$sql = "SELECT COALESCE(SUM(vendor_line.quoted_price * vendor_line.quoted_quantity), 0) AS total_quoted
-		FROM " . TB_PREF . "purch_rfq_vendor_lines vendor_line
-		WHERE vendor_line.rfq_vendor_id = " . (int)$rfq_vendor_id;
-	$result = db_query($sql, 'could not calculate RFQ vendor total');
-	$row = db_fetch($result);
-	$total_quoted = $row ? (float)$row['total_quoted'] : 0;
-
-	$sql = "UPDATE " . TB_PREF . "purch_rfq_vendors SET
-		total_quoted = " . db_escape($total_quoted) . "
-		WHERE id = " . (int)$rfq_vendor_id;
-	db_query($sql, 'could not refresh RFQ vendor total');
-
-	return $total_quoted;
+    $total = 0;
+    $ok = write_purch_rfq_vendor_activity($rfq_vendor_id, function($rfq, $items, $vendor) use (&$total) {
+        $rows = db_query('SELECT quoted_price, quoted_quantity FROM '.TB_PREF.'purch_rfq_vendor_lines WHERE rfq_vendor_id='.(int)$vendor['id'].' ORDER BY id FOR UPDATE');
+        if (!$rows) return false;
+        while ($row = db_fetch($rows)) $total += (float)$row['quoted_price'] * (float)$row['quoted_quantity'];
+        return (bool)db_query('UPDATE '.TB_PREF.'purch_rfq_vendors SET total_quoted='.db_escape($total).' WHERE id='.(int)$vendor['id']);
+    });
+    return $ok ? $total : false;
 }
 
 /**
  * Update the RFQ header status from vendor activity.
  *
  * @param int $rfq_id
- * @return void
+ * @return bool
  */
 function update_purch_rfq_status_from_activity($rfq_id)
 {
-	$rfq = get_purch_rfq($rfq_id);
-	if (!$rfq || in_array($rfq['status'], array('cancelled', 'expired')))
-		return;
-
-	$sql = "SELECT
-		COUNT(*) AS vendor_count,
-		SUM(CASE WHEN status IN ('responded', 'awarded', 'rejected') THEN 1 ELSE 0 END) AS responded_count,
-		SUM(CASE WHEN is_winner = 1 THEN 1 ELSE 0 END) AS winner_count,
-		SUM(CASE WHEN evaluator_score <> 0 OR (evaluator_notes IS NOT NULL AND evaluator_notes <> '') THEN 1 ELSE 0 END) AS evaluated_count,
-		SUM(CASE WHEN sent_date IS NOT NULL THEN 1 ELSE 0 END) AS sent_count
-		FROM " . TB_PREF . "purch_rfq_vendors
-		WHERE rfq_id = " . (int)$rfq_id;
-	$result = db_query($sql, 'could not calculate RFQ activity status');
-	$row = db_fetch($result);
-
-	$new_status = 'draft';
-	if ((int)$row['winner_count'] > 0)
-		$new_status = 'awarded';
-	elseif ((int)$row['evaluated_count'] > 0)
-		$new_status = 'evaluated';
-	elseif ((int)$row['responded_count'] > 0)
-		$new_status = 'received';
-	elseif ((int)$row['sent_count'] > 0)
-		$new_status = 'sent';
-
-	if ($new_status !== $rfq['status']) {
-		$sql = "UPDATE " . TB_PREF . "purch_rfq SET
-			status = " . db_escape($new_status) . "
-			WHERE id = " . (int)$rfq_id;
-		db_query($sql, 'could not update RFQ activity status');
-	}
+    return write_purch_rfq_activity($rfq_id, function($rfq, $items, $vendors) {
+        $sent = false; $responded = false; $evaluated = false; $winner = false;
+        foreach ($vendors as $vendor) {
+            $winner = $winner || (int)$vendor['is_winner'] === 1;
+            $evaluated = $evaluated || (float)$vendor['evaluator_score'] != 0 || (string)$vendor['evaluator_notes'] !== '';
+            $responded = $responded || in_array($vendor['status'], array('responded','awarded','rejected'), true);
+            $sent = $sent || $vendor['sent_date'] !== null;
+        }
+        $status = $winner ? 'awarded' : ($evaluated ? 'evaluated' : ($responded ? 'received' : ($sent ? 'sent' : 'draft')));
+        return $status === $rfq['status'] || (bool)db_query('UPDATE '.TB_PREF.'purch_rfq SET status='.db_escape($status).' WHERE id='.(int)$rfq['id']);
+    });
 }
 
 /**
@@ -1289,70 +1345,33 @@ function update_purch_rfq_status_from_activity($rfq_id)
  */
 function send_rfq_to_vendors($rfq_id, $vendor_ids = array(), &$error_message = null)
 {
-	$error_message = null;
-	$rfq = get_purch_rfq($rfq_id);
-	if (!$rfq || !in_array($rfq['status'], array('draft', 'sent', 'received', 'evaluated')))
-		return false;
-	if ((int)$rfq['item_count'] <= 0) {
-		$error_message = _('Add at least one RFQ item before sending the RFQ to vendors.');
-		return false;
-	}
-
-	$selected_vendor_ids = array();
-	foreach ($vendor_ids as $vendor_id) {
-		if ((int)$vendor_id > 0)
-			$selected_vendor_ids[] = (int)$vendor_id;
-	}
-	$selected_vendor_ids = array_values(array_unique($selected_vendor_ids));
-
-	if (empty($selected_vendor_ids)) {
-		$vendors = get_rfq_vendors($rfq_id);
-		while ($vendor = db_fetch($vendors))
-			$selected_vendor_ids[] = (int)$vendor['id'];
-		$selected_vendor_ids = array_values(array_unique($selected_vendor_ids));
-	}
-
-	if (empty($selected_vendor_ids)) {
-		$error_message = _('Add at least one vendor before sending the RFQ.');
-		return false;
-	}
-
-	$valid_vendor_ids = array();
-	$rfq_vendors = get_rfq_vendors($rfq_id);
-	while ($rfq_vendor = db_fetch($rfq_vendors)) {
-		if (in_array((int)$rfq_vendor['id'], $selected_vendor_ids))
-			$valid_vendor_ids[] = (int)$rfq_vendor['id'];
-	}
-
-	$selected_vendor_ids = array_values(array_unique($valid_vendor_ids));
-	if (empty($selected_vendor_ids)) {
-		$error_message = _('The selected vendors do not belong to this RFQ.');
-		return false;
-	}
-
-	$sql = "UPDATE " . TB_PREF . "purch_rfq_vendors SET
-		sent_date = NOW(),
-		status = CASE
-			WHEN status IN ('responded', 'awarded') THEN status
-			ELSE 'invited'
-		END
-		WHERE id IN (" . implode(',', $selected_vendor_ids) . ")
-		AND rfq_id = " . (int)$rfq_id;
-	db_query($sql, 'could not mark RFQ vendors as sent');
-
-	$sql = "UPDATE " . TB_PREF . "purch_rfq SET
-		status = 'sent'
-		WHERE id = " . (int)$rfq_id . "
-		AND status NOT IN ('awarded', 'cancelled', 'expired')";
-	db_query($sql, 'could not mark RFQ as sent');
-
-	$hook_data = array(
-		'rfq_id' => (int)$rfq_id,
-		'vendor_ids' => $selected_vendor_ids,
-	);
-	hook_invoke_all('purch_rfq_sent', $hook_data);
-
-	return true;
+    $error_message = '';
+    return write_purch_rfq_activity($rfq_id, function($rfq, $items, $vendors) use ($vendor_ids, &$error_message) {
+        if (!$items || !$vendors) {
+            $error_message = _('Add at least one RFQ item and vendor before sending.'); return false;
+        }
+        $selected = array();
+        foreach ((array)$vendor_ids as $id) {
+            $id = dimension_writer_reference_id($id);
+            if (!$id || !isset($vendors[$id])) return false;
+            $selected[$id] = $id;
+        }
+        if (!$selected) {
+            foreach ($vendors as $id=>$vendor)
+                if (lock_purch_rfq_activity_supplier($vendor['supplier_id'])) $selected[] = $id;
+        }
+        if (!$selected) return false;
+        foreach ($selected as $id) {
+            if (!lock_purch_rfq_activity_supplier($vendors[$id]['supplier_id'])) return false;
+            if (!dimension_ordinary_master_write('purch_rfq_vendors', $id, array(), function($admitted) use ($id) {
+                return (bool)db_query("UPDATE ".TB_PREF."purch_rfq_vendors SET sent_date=NOW(), status=CASE WHEN status IN ('responded','awarded') THEN status ELSE 'invited' END WHERE id=".$id);
+            }, true)) return false;
+        }
+        if (!update_purch_rfq_status_from_activity($rfq['id'])) return false;
+        $data = array('rfq_id'=>(int)$rfq['id'], 'vendor_ids'=>array_values($selected));
+        hook_invoke_all('purch_rfq_sent', $data);
+        return true;
+    });
 }
 
 /**
@@ -1370,101 +1389,69 @@ function send_rfq_to_vendors($rfq_id, $vendor_ids = array(), &$error_message = n
  * @return bool
  */
 function record_vendor_response($rfq_id, $supplier_id, $lines, $total, $lead_days, $notes,
-	$payment_terms = '', $custom_data = array(), &$error_message = null)
+    $payment_terms = '', $custom_data = null, &$error_message = null)
 {
-	$error_message = null;
-	$rfq = get_purch_rfq($rfq_id);
-	if (!$rfq || in_array($rfq['status'], array('awarded', 'cancelled', 'expired')))
-		return false;
-
-	$rfq_vendor = get_purch_rfq_vendor_by_supplier($rfq_id, $supplier_id);
-	if (!$rfq_vendor)
-		return false;
-
-	$item_rows = array();
-	$rfq_items = get_rfq_items($rfq_id);
-	while ($item_row = db_fetch($rfq_items))
-		$item_rows[(int)$item_row['id']] = $item_row;
-
-	if (empty($item_rows))
-		return false;
-
-	if (!is_numeric($total) || (float)$total < 0) {
-		$error_message = _('The quoted total must be zero or greater.');
-		return false;
-	}
-
-	$lead_days_value = trim((string)$lead_days);
-	if ($lead_days_value !== '' && (!preg_match('/^-?\d+$/', $lead_days_value) || (int)$lead_days_value < 0)) {
-		$error_message = _('The vendor lead time must be a whole number of days not less than zero.');
-		return false;
-	}
-	$lead_days = $lead_days_value === '' ? 0 : (int)$lead_days_value;
-
-	$normalized_lines = array();
-	if (!normalize_purch_rfq_response_lines($item_rows, $lines, $normalized_lines, $error_message))
-		return false;
-
-	begin_transaction();
-
-	$sql = "DELETE FROM " . TB_PREF . "purch_rfq_vendor_lines WHERE rfq_vendor_id = " . (int)$rfq_vendor['id'];
-	db_query($sql, 'could not clear RFQ vendor response lines');
-
-	$computed_total = 0;
-	foreach ($normalized_lines as $line) {
-		$rfq_item_id = (int)$line['rfq_item_id'];
-		$quoted_price = (float)$line['quoted_price'];
-		$quoted_quantity = (float)$line['quoted_quantity'];
-		$line_lead_days = (int)$line['delivery_lead_days'];
-		$line_notes = trim((string)$line['notes']);
-		$line_custom_data = isset($line['custom_data']) ? $line['custom_data'] : array();
-
-		$sql = "INSERT INTO " . TB_PREF . "purch_rfq_vendor_lines (
-			rfq_vendor_id,
-			rfq_item_id,
-			quoted_price,
-			quoted_quantity,
-			delivery_lead_days,
-			notes,
-			custom_data
-		) VALUES (
-			" . (int)$rfq_vendor['id'] . ",
-			" . (int)$rfq_item_id . ",
-			" . db_escape($quoted_price) . ",
-			" . db_escape($quoted_quantity) . ",
-			" . (int)$line_lead_days . ",
-			" . ($line_notes !== '' ? db_escape($line_notes) : 'NULL') . ",
-			" . sql_purch_rfq_custom_data($line_custom_data) . "
-		)";
-		db_query($sql, 'could not insert RFQ vendor response line');
-
-		$computed_total += $quoted_price * $quoted_quantity;
-	}
-
-	$total_quoted = (float)$total > 0 ? (float)$total : (float)$computed_total;
-
-	$sql = "UPDATE " . TB_PREF . "purch_rfq_vendors SET
-		status = 'responded',
-		response_date = NOW(),
-		total_quoted = " . db_escape($total_quoted) . ",
-		delivery_lead_days = " . (int)$lead_days . ",
-		payment_terms = " . ($payment_terms !== '' ? db_escape($payment_terms) : 'NULL') . ",
-		vendor_notes = " . ($notes !== '' ? db_escape($notes) : 'NULL') . ",
-		custom_data = " . sql_purch_rfq_custom_data($custom_data) . "
-		WHERE id = " . (int)$rfq_vendor['id'];
-	db_query($sql, 'could not update RFQ vendor response');
-
-	commit_transaction();
-	update_purch_rfq_status_from_activity($rfq_id);
-
-	$hook_data = array(
-		'rfq_id' => (int)$rfq_id,
-		'supplier_id' => (int)$supplier_id,
-		'rfq_vendor_id' => (int)$rfq_vendor['id'],
-	);
-	hook_invoke_all('purch_rfq_response_received', $hook_data);
-
-	return true;
+    $error_message = '';
+    return write_purch_rfq_activity($rfq_id, function($rfq, $items, $vendors) use ($supplier_id, $lines, $total, $lead_days, $notes, $payment_terms, $custom_data, &$error_message) {
+        $vendor = false;
+        foreach ($vendors as $row) if ((int)$row['supplier_id'] === (int)$supplier_id) $vendor = $row;
+        if (!$vendor || (int)$vendor['is_winner'] || $vendor['status'] === 'awarded' || !$items
+            || !lock_purch_rfq_activity_supplier($vendor['supplier_id'])) return false;
+        if (!is_numeric($total) || !is_finite((float)$total) || (float)$total < 0) return false;
+        $lead = trim((string)$lead_days);
+        if ($lead !== '' && !preg_match('/^[0-9]+$/D', $lead)) return false;
+        $normalized = array();
+        if (!normalize_purch_rfq_response_lines($items, $lines, $normalized, $error_message)) return false;
+        $rows = db_query('SELECT * FROM '.TB_PREF.'purch_rfq_vendor_lines WHERE rfq_vendor_id='.(int)$vendor['id'].' ORDER BY id FOR UPDATE');
+        if (!$rows) return false;
+        $old = array();
+        while ($row = db_fetch($rows)) {
+            $item = (int)$row['rfq_item_id'];
+            // A retained response with a missing/foreign item has ambiguous
+            // ownership. Replacement must not silently erase that history.
+            if (!isset($items[$item]) || isset($old[$item])) return false;
+            $old[$item] = $row;
+        }
+        $seen = array(); $computed = 0;
+        foreach ($normalized as $line) {
+            $item = (int)$line['rfq_item_id'];
+            if (isset($seen[$item])) return false;
+            $seen[$item] = true;
+            $previous = isset($old[$item]) ? $old[$item] : null;
+            $payload = $line['custom_data'] === null ? ($previous ? $previous['custom_data'] : null) : encode_purch_rfq_custom_data($line['custom_data']);
+            if ($payload === null && $line['custom_data'] !== null && !in_array($line['custom_data'], array('',array()), true)) return false;
+            $ok = dimension_ordinary_master_write('purch_rfq_vendor_lines', $previous ? $previous['id'] : null,
+                array('custom_data'=>$payload), function($admitted) use ($previous, $vendor, $item, $line, $payload) {
+                    $values = 'quoted_price='.db_escape($line['quoted_price']).', quoted_quantity='.db_escape($line['quoted_quantity'])
+                        .', delivery_lead_days='.(int)$line['delivery_lead_days'].', notes='.db_escape($line['notes'])
+                        .', custom_data='.sql_purch_rfq_custom_data($payload);
+                    $sql = $previous ? 'UPDATE '.TB_PREF.'purch_rfq_vendor_lines SET '.$values.' WHERE id='.(int)$previous['id']
+                        : 'INSERT INTO '.TB_PREF.'purch_rfq_vendor_lines SET rfq_vendor_id='.(int)$vendor['id'].', rfq_item_id='.$item.', '.$values;
+                    return (bool)db_query($sql);
+                }, true);
+            if (!$ok) return false;
+            $computed += $line['quoted_price'] * $line['quoted_quantity'];
+        }
+        foreach ($old as $item=>$previous) if (!isset($seen[$item])) {
+            if (!dimension_ordinary_master_write('purch_rfq_vendor_lines', $previous['id'], array(), function($admitted) use ($previous) {
+                return (bool)db_query('DELETE FROM '.TB_PREF.'purch_rfq_vendor_lines WHERE id='.(int)$previous['id']);
+            }, true, true)) return false;
+        }
+        $payload = $custom_data === null ? $vendor['custom_data'] : encode_purch_rfq_custom_data($custom_data);
+        if ($payload === null && $custom_data !== null && !in_array($custom_data, array('',array()), true)) return false;
+        $amount = (float)$total > 0 ? (float)$total : $computed;
+        if (!is_finite($amount)) return false;
+        if (!dimension_ordinary_master_write('purch_rfq_vendors', $vendor['id'], array('custom_data'=>$payload),
+            function($admitted) use ($vendor, $amount, $lead, $payment_terms, $notes, $payload) {
+                return (bool)db_query("UPDATE ".TB_PREF."purch_rfq_vendors SET status='responded', response_date=NOW(), total_quoted=".db_escape($amount)
+                    .', delivery_lead_days='.(int)$lead.', payment_terms='.db_escape($payment_terms).', vendor_notes='.db_escape($notes)
+                    .', custom_data='.sql_purch_rfq_custom_data($payload).' WHERE id='.(int)$vendor['id']);
+            }, true)) return false;
+        if (!update_purch_rfq_status_from_activity($rfq['id'])) return false;
+        $data = array('rfq_id'=>(int)$rfq['id'], 'supplier_id'=>(int)$supplier_id, 'rfq_vendor_id'=>(int)$vendor['id']);
+        hook_invoke_all('purch_rfq_response_received', $data);
+        return true;
+    });
 }
 
 /**
@@ -1477,18 +1464,13 @@ function record_vendor_response($rfq_id, $supplier_id, $lines, $total, $lead_day
  */
 function evaluate_vendor_response($rfq_vendor_id, $score, $notes)
 {
-	$rfq_vendor = get_purch_rfq_vendor($rfq_vendor_id);
-	if (!$rfq_vendor)
-		return false;
-
-	$sql = "UPDATE " . TB_PREF . "purch_rfq_vendors SET
-		evaluator_score = " . db_escape($score) . ",
-		evaluator_notes = " . ($notes !== '' ? db_escape($notes) : 'NULL') . "
-		WHERE id = " . (int)$rfq_vendor_id;
-	db_query($sql, 'could not evaluate RFQ vendor response');
-
-	update_purch_rfq_status_from_activity((int)$rfq_vendor['rfq_id']);
-	return true;
+    if (!is_numeric($score) || !is_finite((float)$score)) return false;
+    return write_purch_rfq_vendor_activity($rfq_vendor_id, function($rfq, $items, $vendor) use ($score, $notes) {
+        if ($vendor['status'] !== 'responded' || (int)$vendor['is_winner']) return false;
+        if (!db_query('UPDATE '.TB_PREF.'purch_rfq_vendors SET evaluator_score='.db_escape($score)
+            .', evaluator_notes='.db_escape($notes).' WHERE id='.(int)$vendor['id'])) return false;
+        return update_purch_rfq_status_from_activity($rfq['id']);
+    });
 }
 
 /**
@@ -1642,7 +1624,7 @@ function award_rfq($rfq_id, $winning_vendor_id, $line_awards = array())
 		AND rfq_id = " . (int)$rfq_id;
 	db_query($sql, 'could not set RFQ winning vendors');
 
-	update_purch_rfq_award_map($rfq_id, $award_map);
+	if (!update_purch_rfq_award_map($rfq_id, $award_map)) { cancel_transaction(); return false; }
 
 	$sql = "UPDATE " . TB_PREF . "purch_rfq SET
 		status = 'awarded'
@@ -1673,201 +1655,195 @@ function award_rfq($rfq_id, $winning_vendor_id, $line_awards = array())
 function create_po_from_rfq($rfq_id, $vendor_id, $line_ids = array())
 {
 	global $Refs;
-
-	$rfq = get_purch_rfq($rfq_id);
-	if (!$rfq || $rfq['status'] !== 'awarded')
+	if (!isset($_SESSION['wa_current_user'])
+		|| !$_SESSION['wa_current_user']->can_access('SA_PURCHASEORDER')
+		|| !$_SESSION['wa_current_user']->can_access('SA_PURCHRFQ'))
 		return false;
-
-	$rfq_vendor = resolve_purch_rfq_vendor_reference($rfq_id, $vendor_id);
-	if (!$rfq_vendor || (int)$rfq_vendor['is_winner'] !== 1)
+	if (!begin_transaction())
 		return false;
+	try {
+		include_once($GLOBALS['path_to_root'].'/purchasing/includes/db/purch_agreement_po_approval_db.inc');
+		include_once($GLOBALS['path_to_root'].'/purchasing/includes/db/purch_rfq_po_approval_db.inc');
+		$snapshot = prepare_rfq_purchase_order($rfq_id, $vendor_id, $line_ids);
+		$purchase_order = $snapshot['cart'];
+		if (rfq_purchase_order_has_pending($rfq_id) || !purchase_order_conversion_direct_authorized($purchase_order))
+			throw new RuntimeException('RFQ purchase approval is required or pending.');
+		$po_number = write_rfq_purchase_order($snapshot);
+		if (!purchase_order_conversion_direct_authorized($purchase_order))
+			throw new RuntimeException('RFQ purchase policy changed.');
 
-	$selected_line_ids = array();
-	foreach ((array)$line_ids as $line_id) {
-		if ((int)$line_id > 0)
-			$selected_line_ids[] = (int)$line_id;
+		if (!commit_transaction()) {
+			if (!empty($GLOBALS['transaction_level']))
+				throw new RuntimeException('Purchase order conversion commit failed.');
+			// SQL is committed: publish its identities so callers cannot mistake
+			// resource cleanup failure for a rolled-back conversion and retry.
+			display_error(_('The purchase order conversion was committed, but resource cleanup needs recovery. Reload the source before continuing.'));
+		}
+		return (int)$po_number;
+	} catch (Exception $exception) {
+		cancel_transaction();
+		return false;
+	} catch (Throwable $exception) {
+		cancel_transaction();
+		throw $exception;
 	}
-
-	$award_map = get_purch_rfq_award_map($rfq['custom_data']);
-	$vendor_lines = get_rfq_vendor_line_map((int)$rfq_vendor['id']);
-
-	$purchase_order = new purch_order();
-	$purchase_order->trans_type = ST_PURCHORDER;
-	$purchase_order->orig_order_date = Today();
-	$purchase_order->due_date = $rfq['required_delivery_date'] ? sql2date($rfq['required_delivery_date']) : Today();
-	$purchase_order->Location = $rfq['delivery_location'];
-	$purchase_order->Comments = sprintf(_('Created from RFQ %s'), $rfq['reference']);
-	$purchase_order->delivery_address = $rfq['delivery_location_name'] ? $rfq['delivery_location_name'] : $rfq['delivery_location'];
-	$purchase_order->rfq_id = (int)$rfq_id;
-
-	get_supplier_details_to_order($purchase_order, (int)$rfq_vendor['supplier_id']);
-	$purchase_order->reference = $Refs->get_next(ST_PURCHORDER, null, array(
-		'supplier_id' => (int)$rfq_vendor['supplier_id'],
-		'date' => $purchase_order->orig_order_date,
-		'location' => $purchase_order->Location,
-	));
-
-	$rfq_items = get_rfq_items($rfq_id);
-	while ($rfq_item = db_fetch($rfq_items)) {
-		$rfq_item_id = (int)$rfq_item['id'];
-		if (!empty($selected_line_ids) && !in_array($rfq_item_id, $selected_line_ids))
-			continue;
-		if (!empty($award_map) && isset($award_map[$rfq_item_id]) && (int)$award_map[$rfq_item_id] !== (int)$rfq_vendor['id'])
-			continue;
-		if (!isset($vendor_lines[$rfq_item_id]))
-			continue;
-
-		$vendor_line = $vendor_lines[$rfq_item_id];
-		$quantity = (float)$vendor_line['quoted_quantity'] > 0 ? (float)$vendor_line['quoted_quantity'] : (float)$rfq_item['quantity'];
-		$price = (float)$vendor_line['quoted_price'];
-		if ($quantity <= 0 || $price <= 0)
-			continue;
-
-		$description = $rfq_item['line_description'] !== '' ? $rfq_item['line_description'] : null;
-		$purchase_order->add_to_order(
-			count($purchase_order->line_items),
-			$rfq_item['stock_id'],
-			$quantity,
-			$description,
-			$price,
-			$rfq_item['line_unit_of_measure'],
-			$purchase_order->due_date,
-			0,
-			0
-		);
-	}
-
-	if (!$purchase_order->order_has_items())
-		return false;
-
-	$po_number = add_po($purchase_order);
-	if (!$po_number)
-		return false;
-
-	$vendor_custom_data = decode_purch_rfq_custom_data($rfq_vendor['custom_data']);
-	if (!isset($vendor_custom_data['created_po_numbers']) || !is_array($vendor_custom_data['created_po_numbers']))
-		$vendor_custom_data['created_po_numbers'] = array();
-	$vendor_custom_data['created_po_numbers'][] = (int)$po_number;
-
-	$sql = "UPDATE " . TB_PREF . "purch_rfq_vendors SET
-		custom_data = " . sql_purch_rfq_custom_data($vendor_custom_data) . "
-		WHERE id = " . (int)$rfq_vendor['id'];
-	db_query($sql, 'could not update RFQ vendor PO linkage');
-
-	$rfq_custom_data = decode_purch_rfq_custom_data($rfq['custom_data']);
-	if (!isset($rfq_custom_data['created_po_numbers']) || !is_array($rfq_custom_data['created_po_numbers']))
-		$rfq_custom_data['created_po_numbers'] = array();
-	$rfq_custom_data['created_po_numbers'][] = (int)$po_number;
-
-	$sql = "UPDATE " . TB_PREF . "purch_rfq SET
-		custom_data = " . sql_purch_rfq_custom_data($rfq_custom_data) . "
-		WHERE id = " . (int)$rfq_id;
-	db_query($sql, 'could not update RFQ PO linkage');
-
-	$hook_data = array(
-		'rfq_id' => (int)$rfq_id,
-		'po_no' => (int)$po_number,
-		'rfq_vendor_id' => (int)$rfq_vendor['id'],
-	);
-	hook_invoke_all('purch_rfq_po_created', $hook_data);
-
-	return (int)$po_number;
 }
 
 /**
  * Expire overdue RFQs.
  *
- * @return int
+ * @return int|false Number expired, or whole-command failure.
  */
 function expire_overdue_rfqs()
 {
-	$sql = "UPDATE " . TB_PREF . "purch_rfq SET
-		status = 'expired'
-		WHERE status IN ('draft', 'sent', 'received', 'evaluated')
-		AND deadline_date IS NOT NULL
-		AND deadline_date < " . db_escape(date2sql(Today()));
-	db_query($sql, 'could not expire overdue RFQs');
+    try {
+        if (!begin_transaction()) return false;
+        // Enumeration is a hint only. Recheck deadline/status under each owner
+        // lock, in ascending identity order, before changing any current row.
+        $today = date2sql(Today());
+        $rows = db_query("SELECT id FROM ".TB_PREF."purch_rfq WHERE status IN ('draft','sent','received','evaluated') AND deadline_date IS NOT NULL AND deadline_date < ".db_escape($today).' ORDER BY id');
+        if (!$rows) { cancel_transaction(); return false; }
+        $ids = array();
+        while ($row = db_fetch($rows)) $ids[] = (int)$row['id'];
+        $count = 0;
+        foreach ($ids as $id) {
+            if (!dimension_ordinary_master_write('purch_rfq', $id, array(), function($admitted) use ($id, $today, &$count) {
+                $rows = db_query('SELECT status, deadline_date FROM '.TB_PREF.'purch_rfq WHERE id='.$id.' FOR UPDATE');
+                $row = $rows ? db_fetch($rows) : false;
+                if (!$row) return false;
+                if (!in_array($row['status'], array('draft','sent','received','evaluated'), true)
+                    || $row['deadline_date'] === null || $row['deadline_date'] >= $today) return true;
+                if (!db_query("UPDATE ".TB_PREF."purch_rfq SET status='expired' WHERE id=".$id)) return false;
+                $count++;
+                return true;
+            }, true)) { cancel_transaction(); return false; }
+        }
+        if (!commit_transaction()) { cancel_transaction(); return false; }
+        return $count;
+    } catch (Exception $exception) { cancel_transaction(); return false;
+    } catch (Throwable $exception) { cancel_transaction(); return false; }
+}
 
-	return db_num_affected_rows();
+/** Read exact current conversion inputs; failure never certifies source absence. */
+function read_requisition_rfq_rows($query)
+{
+    $result = db_query($query);
+    if (!$result) throw new RuntimeException('RFQ requisition source is unavailable.');
+    $rows = array();
+    while ($row = db_fetch_assoc($result)) $rows[] = $row;
+    return $rows;
 }
 
 /**
- * Create one RFQ from an approved requisition.
- *
- * @param int   $requisition_id
- * @param array $supplier_ids
- * @param array $line_ids
- * @return int|false
+ * Construct a sourcing RFQ atomically from current approved requisition rows.
+ * No requisition quantity is consumed: ordering and final approval remain with
+ * the registered PO workflow. Every child failure aborts the entire command.
  */
 function create_rfq_from_requisition($requisition_id, $supplier_ids = array(), $line_ids = array())
 {
-	$requisition = get_purch_requisition($requisition_id);
-	if (!$requisition || !in_array($requisition['status'], array('approved', 'partially_ordered')))
-		return false;
-
-	$selected_line_ids = array();
-	foreach ((array)$line_ids as $line_id) {
-		if ((int)$line_id > 0)
-			$selected_line_ids[] = (int)$line_id;
-	}
-
-	$resolved_supplier_ids = array();
-	foreach ((array)$supplier_ids as $supplier_id) {
-		if ((int)$supplier_id > 0)
-			$resolved_supplier_ids[(int)$supplier_id] = (int)$supplier_id;
-	}
-
-	$rfq_id = add_purch_rfq(
-		'standard',
-		sprintf(_('Created from Purchase Requisition %s'), $requisition['reference']),
-		get_default_purch_rfq_deadline_date(date2sql(Today())),
-		(int)$requisition_id,
-		$requisition['notes'] ? $requisition['notes'] : '',
-		'',
-		$requisition['location'],
-		$requisition['required_date'],
-		'',
-		null,
-		(int)$requisition['dimension_id'],
-		(int)$requisition['dimension2_id'],
-		'',
-		date2sql(Today()),
-		array('created_from_requisition' => 1)
-	);
-
-	$requisition_lines = get_requisition_lines($requisition_id);
-	$inserted_items = 0;
-	while ($line = db_fetch($requisition_lines)) {
-		$remaining_quantity = round((float)$line['quantity'] - (float)$line['qty_ordered'], get_qty_dec($line['stock_id']));
-		if ($remaining_quantity <= 0)
-			continue;
-		if (!empty($selected_line_ids) && !in_array((int)$line['id'], $selected_line_ids))
-			continue;
-
-		add_rfq_item(
-			$rfq_id,
-			$line['stock_id'],
-			$remaining_quantity,
-			(float)$line['estimated_unit_price'],
-			$line['notes'] ? $line['notes'] : '',
-			$line['line_description'],
-			$line['line_unit_of_measure'],
-			$inserted_items + 1,
-			array('requisition_line_id' => (int)$line['id'])
-		);
-		$inserted_items++;
-
-		if ((int)$line['preferred_supplier_id'] > 0)
-			$resolved_supplier_ids[(int)$line['preferred_supplier_id']] = (int)$line['preferred_supplier_id'];
-	}
-
-	if ($inserted_items === 0) {
-		delete_purch_rfq($rfq_id);
-		return false;
-	}
-
-	foreach ($resolved_supplier_ids as $supplier_id)
-		add_rfq_vendor($rfq_id, $supplier_id);
-
-	return $rfq_id;
+    global $db_connections;
+    $actor = isset($_SESSION['wa_current_user']) ? $_SESSION['wa_current_user'] : null;
+    if (!is_object($actor) || !is_callable(array($actor, 'can_access'))
+        || !$actor->can_access('SA_PURCHREQUISITION') || !$actor->can_access('SA_PURCHRFQ')
+        || empty($actor->user) || !isset($actor->cur_con, $db_connections[$actor->cur_con])
+        || !is_scalar($requisition_id) || (string)(int)$requisition_id !== (string)$requisition_id
+        || (int)$requisition_id <= 0 || !is_array($supplier_ids) || !is_array($line_ids)) return false;
+    $company = $actor->cur_con; $connection = $db_connections[$company]; $user = $actor->user;
+    $selected = $suppliers = array();
+    foreach (array('lines'=>$line_ids, 'suppliers'=>$supplier_ids) as $kind=>$ids) {
+        foreach ($ids as $id) {
+            if (!is_scalar($id) || (string)(int)$id !== (string)$id || (int)$id <= 0) return false;
+            if ($kind === 'lines') $selected[(int)$id] = true;
+            else $suppliers[(int)$id] = (int)$id;
+        }
+    }
+    try {
+        if (!begin_transaction()) return false;
+        $queries = array('header'=>'SELECT * FROM '.TB_PREF.'purch_requisitions WHERE id='.(int)$requisition_id.' FOR UPDATE',
+            'lines'=>'SELECT line.*, item.description AS stock_description, item.units AS stock_units, item.inactive AS stock_inactive, unit.decimals AS stock_decimals FROM '.TB_PREF.'purch_requisition_lines line LEFT JOIN '.TB_PREF.'stock_master item ON item.stock_id=line.stock_id LEFT JOIN '.TB_PREF.'item_units unit ON unit.abbr=item.units WHERE line.requisition_id='.(int)$requisition_id.' ORDER BY line.id FOR UPDATE');
+        $snapshot = array();
+        foreach ($queries as $key=>$query) $snapshot[$key] = read_requisition_rfq_rows($query);
+        if (count($snapshot['header']) !== 1) throw new RuntimeException('Requisition is unavailable.');
+        $requisition = $snapshot['header'][0];
+        if (!in_array($requisition['status'], array('approved','partially_ordered'), true))
+            throw new RuntimeException('Requisition is not approved.');
+        $queries['location'] = 'SELECT * FROM '.TB_PREF.'locations WHERE loc_code='.db_escape($requisition['location']).' AND inactive=0 FOR UPDATE';
+        $snapshot['location'] = read_requisition_rfq_rows($queries['location']);
+        if (count($snapshot['location']) !== 1) throw new RuntimeException('Requisition location is unavailable.');
+        if ((int)$requisition['material_request_id'] > 0) {
+            if (!$actor->can_access('SA_MATERIALREQUEST')) throw new RuntimeException('Linked Warehouse authority is unavailable.');
+            $queries['material'] = 'SELECT * FROM '.TB_PREF.'wh_material_requests WHERE request_id='.(int)$requisition['material_request_id'].' FOR UPDATE';
+            $snapshot['material'] = read_requisition_rfq_rows($queries['material']);
+            if (count($snapshot['material']) !== 1 || !in_array($snapshot['material'][0]['status'], array('approved','ordered'), true))
+                throw new RuntimeException('Linked Warehouse source is unavailable.');
+        }
+        $items = $used = array();
+        foreach ($snapshot['lines'] as $line) {
+            if ($selected && !isset($selected[(int)$line['id']])) continue;
+            if ($line['status'] === 'rejected') continue;
+            if (!is_finite((float)$line['quantity']) || !is_finite((float)$line['qty_ordered'])
+                || (float)$line['quantity'] <= 0 || (float)$line['qty_ordered'] < 0
+                || (float)$line['qty_ordered'] > (float)$line['quantity'])
+                throw new RuntimeException('Requisition quantities require reconciliation.');
+            // Match get_qty_dec's legacy fallback using current locked UOM inputs.
+            $decimals = $line['stock_decimals'];
+            if ($decimals == -1 || $decimals == null) $decimals = user_qty_dec();
+            $remaining = round((float)$line['quantity'] - (float)$line['qty_ordered'], (int)$decimals);
+            if ($remaining <= 0) continue;
+            if ($line['stock_description'] === null || (int)$line['stock_inactive'] !== 0
+                || !is_finite((float)$line['estimated_unit_price']) || (float)$line['estimated_unit_price'] < 0)
+                throw new RuntimeException('Requisition item is unavailable.');
+            $line['remaining_quantity'] = $remaining; $items[] = $line; $used[(int)$line['id']] = true;
+            if ((int)$line['preferred_supplier_id'] > 0) $suppliers[(int)$line['preferred_supplier_id']] = (int)$line['preferred_supplier_id'];
+        }
+        if (!$items || ($selected && count($selected) !== count($used))) throw new RuntimeException('Selected requisition lines are unavailable.');
+        ksort($suppliers, SORT_NUMERIC);
+        foreach ($suppliers as $supplier) {
+            $key = 'supplier_'.$supplier;
+            $queries[$key] = 'SELECT * FROM '.TB_PREF.'suppliers WHERE supplier_id='.$supplier.' AND inactive=0 FOR UPDATE';
+            $snapshot[$key] = read_requisition_rfq_rows($queries[$key]);
+            if (count($snapshot[$key]) !== 1) throw new RuntimeException('Requisition supplier is unavailable.');
+        }
+        $description = sprintf(_('Created from Purchase Requisition %s'), $requisition['reference']);
+        $rfq_id = add_purch_rfq('standard', $description,
+            get_default_purch_rfq_deadline_date(date2sql(Today())), (int)$requisition_id,
+            $requisition['notes'] ? $requisition['notes'] : '', '', $requisition['location'],
+            $requisition['required_date'], '', null, (int)$requisition['dimension_id'],
+            (int)$requisition['dimension2_id'], '', date2sql(Today()), array('created_from_requisition'=>1));
+        if (!$rfq_id) throw new RuntimeException('RFQ header could not be created.');
+        $sort = 0;
+        foreach ($items as $line) {
+            if (!add_rfq_item($rfq_id, $line['stock_id'], $line['remaining_quantity'],
+                (float)$line['estimated_unit_price'], $line['notes'] ? $line['notes'] : '',
+                $line['description'] !== null ? $line['description'] : $line['stock_description'],
+                $line['unit_of_measure'] !== '' ? $line['unit_of_measure'] : $line['stock_units'], ++$sort,
+                array('requisition_line_id'=>(int)$line['id']))) throw new RuntimeException('RFQ item could not be created.');
+        }
+        foreach ($suppliers as $supplier) if (!add_rfq_vendor($rfq_id, $supplier))
+            throw new RuntimeException('RFQ vendor could not be created.');
+        // Extension callbacks cannot change trusted company, source or derived header intent.
+        $current = isset($_SESSION['wa_current_user']) ? $_SESSION['wa_current_user'] : null;
+        if (!is_object($current) || $current->cur_con !== $company || $current->user !== $user
+            || !isset($db_connections[$company]) || $db_connections[$company] !== $connection
+            || !$current->can_access('SA_PURCHREQUISITION') || !$current->can_access('SA_PURCHRFQ')
+            || ((int)$requisition['material_request_id'] > 0 && !$current->can_access('SA_MATERIALREQUEST')))
+            throw new RuntimeException('RFQ conversion authority changed.');
+        foreach ($queries as $key=>$query) if (read_requisition_rfq_rows($query) !== $snapshot[$key])
+            throw new RuntimeException('RFQ conversion source changed.');
+        $headers = read_requisition_rfq_rows('SELECT * FROM '.TB_PREF.'purch_rfq WHERE id='.(int)$rfq_id.' FOR UPDATE');
+        if (count($headers) !== 1) throw new RuntimeException('RFQ destination is unavailable.');
+        $expected = array('requisition_id'=>(int)$requisition_id, 'dimension_id'=>(int)$requisition['dimension_id'],
+            'dimension2_id'=>(int)$requisition['dimension2_id'], 'created_by'=>(int)$user,
+            'description'=>trim($description), 'notes'=>trim((string)$requisition['notes']) !== '' ? trim($requisition['notes']) : null,
+            'delivery_location'=>trim($requisition['location']), 'required_delivery_date'=>$requisition['required_date'],
+            'status'=>'draft', 'rfq_type'=>'standard');
+        $where = array('id='.(int)$rfq_id);
+        foreach ($expected as $field=>$value) $where[] = $field.' <=> '.($value === null ? 'NULL' : db_escape($value));
+        if (count(read_requisition_rfq_rows('SELECT id FROM '.TB_PREF.'purch_rfq WHERE '.implode(' AND ', $where).' FOR UPDATE')) !== 1
+            || $headers[0]['custom_data'] !== encode_purch_rfq_custom_data(array('created_from_requisition'=>1)))
+            throw new RuntimeException('RFQ destination intent changed.');
+        if (!commit_transaction()) { cancel_transaction(); return false; }
+        return $rfq_id;
+    } catch (Exception $exception) { cancel_transaction(); return false;
+    } catch (Throwable $exception) { cancel_transaction(); return false; }
 }

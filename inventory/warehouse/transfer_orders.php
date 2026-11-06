@@ -29,6 +29,7 @@ include_once($path_to_root . '/includes/data_checks.inc');
 include_once($path_to_root . '/includes/ui.inc');
 include_once($path_to_root . '/includes/ui/ui_lists.inc');
 include_once($path_to_root . '/inventory/warehouse/includes/db/warehouse_transfers_db.inc');
+include_once($path_to_root . '/inventory/warehouse/includes/db/warehouse_transfer_fulfillment_db.inc');
 include_once($path_to_root . '/inventory/includes/db/serial_batch_db.inc');
 
 $js = '';
@@ -40,6 +41,23 @@ page(_($help_context = 'Transfer Orders'), false, false, '', $js);
 // =====================================================================
 // HANDLE ACTIONS
 // =====================================================================
+
+/** Bind native approval commands to the actor, role and company which rendered the form. */
+function get_transfer_order_core_form_context()
+{
+    global $db_connections;
+    $actor = $_SESSION['wa_current_user'];
+    return hash_hmac('sha256', serialize(array($actor->user, $actor->access, $actor->cur_con,
+        $db_connections[$actor->cur_con])), ensure_csrf_token());
+}
+if (isset($_POST['Submit']) || isset($_POST['Cancel']) || isset($_POST['Ship']) || isset($_POST['Receive']) || isset($_POST['Delete']) || isset($_POST['AddLine']) || isset($_POST['ADD_ITEM']) || isset($_POST['UPDATE_ITEM']) || find_submit('DeleteLine') > 0) {
+    $context = get_post('transfer_core_context', '');
+    if (!is_string($context) || !hash_equals(get_transfer_order_core_form_context(), $context)) {
+        unset($_POST['Submit'], $_POST['Cancel'], $_POST['Ship'], $_POST['Receive'], $_POST['Delete'], $_POST['AddLine'], $_POST['ADD_ITEM'], $_POST['UPDATE_ITEM']);
+        foreach (array_keys($_POST) as $key) if (preg_match('/^DeleteLine[0-9]+$/D', $key)) unset($_POST[$key]);
+        display_error(_('The transfer order form context has changed. Reload this page before changing this order.'));
+    }
+}
 
 $selected_id = get_post('selected_id', isset($_GET['selected_id']) ? $_GET['selected_id'] : -1);
 if ($selected_id == '') $selected_id = -1;
@@ -68,7 +86,7 @@ if (isset($_POST['Ship']) && $selected_id > 0) {
 	if (ship_transfer_order($selected_id, $ship_date)) {
 		display_notification(_('Transfer order has been shipped and is now in transit.'));
 	} else {
-		display_error(_('Cannot ship this transfer order. It must be in Approved status.'));
+		display_error(_('Cannot ship this transfer order. Verify its approval evidence, available stock and required tracking, and choose a date in an authorized open accounting period.'));
 	}
 	$selected_id = -1;
 }
@@ -88,7 +106,7 @@ if (isset($_POST['Receive']) && $selected_id > 0) {
 		}
 	}
 
-	$recv_result = receive_transfer_order($selected_id, $recv_date, $received);
+	$recv_result = receive_transfer_order($selected_id, $recv_date, $received, get_post('transfer_receipt_source', ''));
 	if ($recv_result['success']) {
 		display_notification($recv_result['message']);
 		if ($recv_result['backorder_id']) {
@@ -103,7 +121,7 @@ if (isset($_POST['Receive']) && $selected_id > 0) {
 // --- Cancel action ---
 if (isset($_POST['Cancel']) && $selected_id > 0) {
 	if (cancel_transfer_order($selected_id)) {
-		display_notification(_('Transfer order has been cancelled.'));
+		display_notification(_('Transfer order has been cancelled.').' '._('Cancellation does not release linked Material demand.'));
 	} else {
 		display_error(_('Cannot cancel this transfer order.'));
 	}
@@ -123,6 +141,17 @@ if (isset($_POST['Delete']) && $selected_id > 0) {
 // --- Save new/edit ---
 if (isset($_POST['ADD_ITEM']) || isset($_POST['UPDATE_ITEM'])) {
 	$input_error = 0;
+	if (isset($_POST['ADD_ITEM']) && isset($_POST['UPDATE_ITEM'])) {
+		display_error(_('Select one transfer order command and retry.'));
+		$input_error = 1;
+	}
+	foreach (array('from_loc','to_loc','request_date','transfer_type','reference','memo','expected_ship','expected_recv') as $field) {
+		if (!is_string(get_post($field, ''))) {
+			display_error(_('Invalid transfer order input. Reload this form and retry.'));
+			$input_error = 1;
+			break;
+		}
+	}
 
 	if (get_post('from_loc') == get_post('to_loc')) {
 		display_error(_('Source and destination locations must be different.'));
@@ -147,16 +176,19 @@ if (isset($_POST['ADD_ITEM']) || isset($_POST['UPDATE_ITEM'])) {
 				$request_date, $transfer_type,
 				$reference, $memo, $expected_ship, $expected_recv
 			);
-			display_notification(sprintf(_('Transfer order #%d has been created.'), $new_id));
-			$selected_id = $new_id; // Stay on the new order to add lines
+			if ($new_id) {
+				display_notification(sprintf(_('Transfer order #%d has been created.'), $new_id));
+				$selected_id = $new_id;
+			} else display_error(_('Cannot create this transfer order. Reload and verify the draft inputs.'));
 		} else {
-			update_transfer_order(
+			$updated = update_transfer_order(
 				$selected_id,
 				get_post('from_loc'), get_post('to_loc'),
 				$request_date, $transfer_type,
 				$reference, $memo, $expected_ship, $expected_recv
 			);
-			display_notification(_('Transfer order has been updated.'));
+			if ($updated) display_notification(_('Transfer order has been updated.'));
+			else display_error(_('Cannot update this transfer order. Reload and verify current draft ownership and inputs.'));
 		}
 	}
 }
@@ -174,7 +206,7 @@ if (isset($_POST['AddLine'])) {
 		$item_info = get_item_edit_info($line_stock);
 		$unit_cost = $item_info ? $item_info['material_cost'] : 0;
 
-		add_transfer_order_line(
+		$line_result = add_transfer_order_line(
 			$selected_id,
 			$line_stock,
 			$line_qty,
@@ -182,15 +214,17 @@ if (isset($_POST['AddLine'])) {
 			null, null, // batch/serial (assigned during ship)
 			$unit_cost
 		);
-		display_notification(_('Line added to transfer order.'));
+		if ($line_result !== false) display_notification(_('Line added to transfer order.'));
+		else display_error(_('Cannot add this line. Reload the current standalone draft and retry.'));
 	}
 }
 
 // --- Delete line ---
 $del_line = find_submit('DeleteLine');
 if ($del_line > 0) {
-	delete_transfer_order_line($del_line);
-	display_notification(_('Line removed from transfer order.'));
+	if ($selected_id > 0 && delete_transfer_order_line($del_line, $selected_id))
+		display_notification(_('Line removed from transfer order.'));
+	else display_error(_('Cannot remove this line. Reload the current standalone draft and retry.'));
 }
 
 // --- Edit button from list ---
@@ -221,6 +255,7 @@ if (isset($_POST['New'])) {
 // =====================================================================
 
 start_form();
+hidden('transfer_core_context', get_transfer_order_core_form_context());
 
 // --- FILTERS ---
 start_table(TABLESTYLE_NOBORDER);
@@ -358,6 +393,32 @@ if ($selected_id > 0 || isset($_POST['New'])) {
 		label_row(_('Received By:'), $order['received_by_name'] ? $order['received_by_name'] : '--');
 		end_outer_table(1);
 
+		if ($editing && (int)$order['requested_by'] === (int)$_SESSION['wa_current_user']->user) {
+			// Stored display strings already carry native encoding. Preserve failed
+			// posted input; a fresh view takes current values from the native source.
+			if (!isset($_POST['UPDATE_ITEM'])) {
+				foreach (array('from_loc'=>'from_loc_code','to_loc'=>'to_loc_code','transfer_type'=>'transfer_type',
+					'reference'=>'reference','memo'=>'memo') as $input=>$field) $_POST[$input] = $order[$field];
+				foreach (array('request_date'=>'request_date','expected_ship'=>'expected_ship_date','expected_recv'=>'expected_recv_date') as $input=>$field)
+					$_POST[$input] = $order[$field] === null ? '' : sql2date($order[$field]);
+			}
+			display_heading(_('Edit Transfer Header'));
+			start_outer_table();
+			table_section(1);
+			array_selector_row(_('Transfer Type:'), 'transfer_type', null,
+				array('standard'=>_('Standard'),'urgent'=>_('Urgent'),'backorder'=>_('Backorder')));
+			locations_list_row(_('From Location:'), 'from_loc', null);
+			locations_list_row(_('To Location:'), 'to_loc', null);
+			date_row(_('Request Date:'), 'request_date', '', true);
+			table_section(2);
+			date_row(_('Expected Ship Date:'), 'expected_ship');
+			date_row(_('Expected Receive Date:'), 'expected_recv');
+			text_row(_('Reference:'), 'reference', null, 30, 60);
+			textarea_row(_('Memo:'), 'memo', null, 50, 3);
+			end_outer_table(1);
+			submit_center('UPDATE_ITEM', _('Update Transfer Order'), true, '', 'default');
+		}
+
 		// --- Line items ---
 		display_heading(_('Line Items'));
 		$show_receive_qty = in_array($order['status'], array('in_transit', 'shipped'));
@@ -387,8 +448,10 @@ if ($selected_id > 0 || isset($_POST['New'])) {
 			if ($show_receive_qty) {
 				echo '<td>';
 				$outstanding = $line['qty_shipped'] - $line['qty_received'];
+				// The native receipt quantity is DECIMAL(15,4). A lower item
+				// display precision must not round the outstanding form value up.
 				echo '<input type="text" name="recv_qty_' . $line['line_id']
-					. '" value="' . number_format2($outstanding, get_qty_dec($line['stock_id']))
+					. '" value="' . number_format2($outstanding, max(4, get_qty_dec($line['stock_id'])))
 					. '" size="8" class="amount">';
 				echo '</td>';
 			}
@@ -458,6 +521,8 @@ if ($selected_id > 0 || isset($_POST['New'])) {
 			submit('Ship', _('Ship Items'), true, _('Mark as shipped and create stock moves'));
 		}
 		if ($show_receive_qty) {
+			$receipt_source = transfer_fulfillment_source((int)$selected_id);
+			hidden('transfer_receipt_source', $receipt_source ? transfer_core_source_fingerprint($receipt_source) : '');
 			echo '<br><br>';
 			start_table(TABLESTYLE_NOBORDER);
 			date_row(_('Receive Date:'), 'recv_date', '', true);

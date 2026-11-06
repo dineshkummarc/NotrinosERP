@@ -19,6 +19,7 @@ include_once($path_to_root . '/includes/data_checks.inc');
 include_once($path_to_root . '/includes/ui.inc');
 include_once($path_to_root . '/includes/ui/ui_lists.inc');
 include_once($path_to_root . '/purchasing/includes/purchasing_db.inc');
+include_once($path_to_root . '/purchasing/includes/db/purch_requisition_refresh_db.inc');
 
 $js = '';
 if ($SysPrefs->use_popup_windows && $SysPrefs->use_popup_search)
@@ -93,6 +94,26 @@ function can_save_purchase_requisition_line($stock_id_field_name = 'line_stock_i
 	return true;
 }
 
+/** Bind native header commands to their rendering actor/company configuration. */
+function get_purch_requisition_header_form_context()
+{
+	global $db_connections;
+	$user = $_SESSION['wa_current_user'];
+	return hash_hmac('sha256', serialize(array($user->user, $user->cur_con,
+		$db_connections[$user->cur_con])), ensure_csrf_token());
+}
+
+if (isset($_POST['ADD_ITEM']) || isset($_POST['UPDATE_ITEM']) || isset($_POST['DeleteRequisition']) || isset($_POST['AddLine']) || isset($_POST['SubmitRequisition']) || isset($_POST['RefreshRequisition']) || isset($_POST['RecoverDuplicateRequisition'])
+	|| isset($_POST['CreateFromMaterialRequest']) || find_submit('UpdateLine') > 0 || find_submit('DeleteLine') > 0) {
+	$header_context = get_post('header_context', '');
+	if (!is_string($header_context) || !hash_equals(get_purch_requisition_header_form_context(), $header_context)) {
+		unset($_POST['ADD_ITEM'], $_POST['UPDATE_ITEM'], $_POST['DeleteRequisition'], $_POST['AddLine'], $_POST['CreateFromMaterialRequest'], $_POST['SubmitRequisition'], $_POST['RefreshRequisition'], $_POST['RecoverDuplicateRequisition']);
+		foreach (array_keys($_POST) as $key)
+			if (preg_match('/^(?:UpdateLine|DeleteLine)/', $key)) unset($_POST[$key]);
+		display_error(_('The requisition form context has changed. Reload this page before saving.'));
+	}
+}
+
 $selected_id = get_post('selected_id', 0);
 if (!$selected_id && isset($_GET['requisition_id']))
 	$selected_id = (int)$_GET['requisition_id'];
@@ -100,15 +121,15 @@ if (isset($_GET['New']))
 	$selected_id = 0;
 
 if (isset($_POST['CreateFromMaterialRequest'])) {
-	$material_request_id = (int)get_post('material_request_id');
-	if ($material_request_id <= 0) {
+	$material_request_id = get_post('material_request_id');
+	if (!is_string($material_request_id) || !preg_match('/^[1-9][0-9]*$/D', $material_request_id)) {
 		display_error(_('Enter a valid material request ID to bridge.'));
 	} else {
 		$bridged_requisition_id = create_requisition_from_material_request($material_request_id);
 		if ($bridged_requisition_id) {
 			meta_forward($_SERVER['PHP_SELF'], 'requisition_id=' . $bridged_requisition_id . get_sel_app_param());
 		} else {
-			display_error(_('The selected material request could not be converted into a purchase requisition.'));
+			display_error(_('The material request could not be bridged. New bridges require an unlinked draft with valid, unfulfilled lines and permission for both modules.'));
 		}
 	}
 }
@@ -123,8 +144,8 @@ if ((isset($_POST['ADD_ITEM']) || isset($_POST['UPDATE_ITEM'])) && can_save_purc
 	$notes = get_post('notes');
 	$location = get_post('location');
 	$reference = trim(get_post('reference'));
-	$dimension_id = (int)get_post('dimension_id');
-	$dimension2_id = (int)get_post('dimension2_id');
+	$dimension_id = get_post('dimension_id', null);
+	$dimension2_id = get_post('dimension2_id', null);
 
 	if (isset($_POST['ADD_ITEM'])) {
 		$selected_id = add_purch_requisition(
@@ -141,8 +162,12 @@ if ((isset($_POST['ADD_ITEM']) || isset($_POST['UPDATE_ITEM'])) && can_save_purc
 			$request_date
 		);
 
-		display_notification(_('Purchase requisition has been created.'));
-		meta_forward($_SERVER['PHP_SELF'], 'requisition_id=' . $selected_id . get_sel_app_param());
+		if ($selected_id) {
+			display_notification(_('Purchase requisition has been created.'));
+			meta_forward($_SERVER['PHP_SELF'], 'requisition_id=' . $selected_id . get_sel_app_param());
+		} else {
+			display_error(_('The purchase requisition could not be created.'));
+		}
 	} else {
 		if (update_purch_requisition(
 			$selected_id,
@@ -241,6 +266,24 @@ if (isset($_POST['SubmitRequisition']) && $selected_id > 0) {
 	}
 }
 
+if (isset($_POST['RefreshRequisition']) && $selected_id > 0) {
+	$result = refresh_purch_requisition_approval($selected_id, get_post('refresh_draft_id', ''));
+	if ($result === false) {
+		display_error(_('The pending review could not be refreshed. Reload and verify the original submitter, source history and current approval setup.'));
+	} else {
+		display_notification(sprintf(_('Approval review restarted as draft #%d. All checker decisions are required again.'), $result['draft_id']));
+	}
+}
+
+if (isset($_POST['RecoverDuplicateRequisition']) && $selected_id > 0) {
+	$result = recover_purch_requisition_duplicate_approvals($selected_id, get_post('duplicate_draft_ids', array()));
+	if ($result === false) {
+		display_error(_('The duplicate reviews could not be recovered. Reload and verify the original submitter, unchanged source history and current approval setup.'));
+	} else {
+		display_notification(sprintf(_('Duplicate reviews were cancelled and approval restarted as draft #%d. All checker decisions are required again.'), $result['draft_id']));
+	}
+}
+
 if (isset($_POST['DeleteRequisition']) && $selected_id > 0) {
 	if (delete_purch_requisition($selected_id)) {
 		display_notification(_('Purchase requisition has been deleted.'));
@@ -252,14 +295,14 @@ if (isset($_POST['DeleteRequisition']) && $selected_id > 0) {
 
 if (isset($_POST['CreatePO']) && $selected_id > 0) {
 	$supplier_id = get_post('create_po_supplier') == ALL_TEXT ? 0 : (int)get_post('create_po_supplier');
-	$po_numbers = create_po_from_requisition($selected_id, $supplier_id);
-	if (!$po_numbers) {
-		display_error(_('No purchase order could be created from this requisition.'));
-	} else {
-		display_notification(sprintf(_('Created %d purchase order(s) from this requisition.'), count($po_numbers)));
-		foreach ($po_numbers as $po_number)
-			display_note(get_trans_view_str(ST_PURCHORDER, $po_number, _('View Purchase Order') . ' #' . $po_number), 0, 1);
-	}
+ include_once($path_to_root.'/purchasing/includes/db/purch_requisition_po_approval_db.inc');
+ $results = submit_requisition_purchase_orders($selected_id, $supplier_id);
+ if (!$results) display_error(_('No purchase order could be created or submitted from this requisition.'));
+ else foreach ($results as $result) {
+  if ($result['status'] === 'pending') display_notification(sprintf(_('Purchase order %d has been submitted for approval.'), $result['trans_no']));
+  else display_note(get_trans_view_str(ST_PURCHORDER, $result['trans_no'], _('View Purchase Order').' #'.$result['trans_no']), 0, 1);
+ }
+
 }
 
 if (isset($_POST['CreateRFQ']) && $selected_id > 0) {
@@ -303,6 +346,7 @@ if ($requisition) {
 $priorities = get_purch_requisition_priorities();
 
 start_form();
+hidden('header_context', get_purch_requisition_header_form_context());
 
 echo '<div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;">';
 echo '<div>';
@@ -454,6 +498,18 @@ if ($requisition) {
 	} elseif ($requisition['status'] === 'submitted') {
 		display_note(_('This requisition is pending approval in the core Approval Dashboard.'), 0, 1);
 		hyperlink_no_params($path_to_root.'/admin/approval_dashboard.php?&sel_app=system', _('Go to Approval Dashboard'));
+		$refresh_draft = get_purch_requisition_refresh_draft($selected_id);
+		if ($refresh_draft !== false) {
+			hidden('refresh_draft_id', $refresh_draft);
+			br();
+			submit('RefreshRequisition', _('Restart Approval Review'), true, _('Cancel this pending review and submit under current policy; all checker decisions restart.'));
+		}
+		$duplicates = get_purch_requisition_duplicate_drafts($selected_id);
+		if ($duplicates !== false) {
+			foreach ($duplicates as $draft_id) hidden('duplicate_draft_ids[]', $draft_id);
+			display_note(sprintf(_('Duplicate pending review IDs: %s'), implode(', ', $duplicates)), 0, 1);
+			submit('RecoverDuplicateRequisition', _('Recover Duplicate Reviews'), true, _('Cancel every listed review and restart under current policy; all checker decisions restart.'));
+		}
 	} elseif (in_array($requisition['status'], array('approved', 'partially_ordered'))) {
 		start_table(TABLESTYLE_NOBORDER, "style='margin:0 auto;' width='420'");
 		supplier_list_row(_('Create PO For Supplier:'), 'create_po_supplier', null, true, false, true);

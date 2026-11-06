@@ -26,6 +26,7 @@ $path_to_root = '../..';
 
 include_once($path_to_root . '/includes/session.inc');
 include_once($path_to_root . '/includes/date_functions.inc');
+include_once($path_to_root . '/purchasing/includes/purchasing_db.inc');
 include_once($path_to_root . '/includes/data_checks.inc');
 include_once($path_to_root . '/includes/ui.inc');
 include_once($path_to_root . '/includes/ui/ui_lists.inc');
@@ -40,6 +41,44 @@ page(_($help_context = 'Material Requests'), false, false, '', $js);
 // =====================================================================
 // HANDLE ACTIONS
 // =====================================================================
+
+/** Bind approval commands to the actor/company which rendered this native form. */
+function get_material_request_core_form_context()
+{
+	global $db_connections;
+	$user = $_SESSION['wa_current_user'];
+	return hash_hmac('sha256', serialize(array($user->user, $user->cur_con,
+		$db_connections[$user->cur_con])), ensure_csrf_token());
+}
+
+$material_line_commands = array('AddLine', 'UpdateLine', 'DeleteLine');
+$material_line_post = isset($_POST['AddLine']) || find_submit('UpdateLine') > 0 || find_submit('DeleteLine') > 0;
+if ($material_line_post || isset($_POST['ADD_ITEM']) || isset($_POST['UPDATE_ITEM']) || isset($_POST['Submit']) || isset($_POST['CancelMR']) || isset($_POST['Delete']) || isset($_POST['ConvertPO']) || isset($_POST['ConvertTO']) || isset($_POST['ReleaseTO'])) {
+	$core_context = get_post('material_core_context', '');
+	if (!is_string($core_context) || !hash_equals(get_material_request_core_form_context(), $core_context)) {
+		unset($_POST['Submit'], $_POST['CancelMR'], $_POST['Delete'], $_POST['UPDATE_ITEM'], $_POST['ADD_ITEM'], $_POST['ConvertPO'], $_POST['ConvertTO'], $_POST['ReleaseTO']);
+		foreach (array_keys($_POST) as $field)
+			foreach ($material_line_commands as $command)
+				if ($field === $command || strpos($field, $command) === 0) unset($_POST[$field]);
+		display_error(_('The material request form context has changed. Reload this page before changing this request.'));
+	}
+}
+
+// Submission and release each own one command; never combine with an edit/conversion.
+if (isset($_POST['ReleaseTO']) || isset($_POST['Submit'])) {
+	$release_conflict = $material_line_post;
+	$material_command_count = 0;
+	foreach (array('ADD_ITEM','UPDATE_ITEM','Submit','CancelMR','Delete','ConvertPO','ConvertTO','ReleaseTO') as $command)
+		if (isset($_POST[$command])) $material_command_count++;
+	if ($material_command_count > 1) $release_conflict = true;
+	if ($release_conflict) {
+		unset($_POST['ReleaseTO'], $_POST['ADD_ITEM'], $_POST['UPDATE_ITEM'], $_POST['Submit'],
+			$_POST['CancelMR'], $_POST['Delete'], $_POST['ConvertPO'], $_POST['ConvertTO']);
+		foreach (array_keys($_POST) as $field) foreach ($material_line_commands as $command)
+			if ($field === $command || strpos($field, $command) === 0) unset($_POST[$field]);
+		display_error(_('Choose one material request command and retry.'));
+	}
+}
 
 $selected_id = get_post('selected_id', null);
 if ($selected_id === null || $selected_id === '')
@@ -60,7 +99,19 @@ if (isset($_POST['Submit']) && $selected_id > 0) {
 			display_notification(_('Material request has been submitted.'));
 		}
 	} else {
-		display_error(_('Cannot submit this material request. It must be in Draft status, have at least one line, and pass approval setup validation.'));
+		display_error(_('Cannot submit this material request. The original maker must retain exact Draft, released Transfer demand or receipt-bound rejected/cancelled replacement custody and valid independent approval setup.'));
+	}
+	$Ajax->activate('mr_list');
+	$Ajax->activate('mr_detail');
+}
+
+// --- Release cancelled Transfer demand ---
+if (isset($_POST['ReleaseTO']) && $selected_id > 0) {
+	include_once($path_to_root.'/inventory/warehouse/includes/db/warehouse_material_transfer_release_db.inc');
+	if (release_cancelled_material_transfer($selected_id, _('Released from material request entry.'))) {
+		display_notification(_('Cancelled Transfer demand has been released. Request a new independent approval before creating a replacement.'));
+	} else {
+		display_error(_('Cannot release this demand. The original maker must retain both native permissions and exact independently cancelled Transfer custody.'));
 	}
 	$Ajax->activate('mr_list');
 	$Ajax->activate('mr_detail');
@@ -83,7 +134,7 @@ if (isset($_POST['Delete']) && $selected_id > 0) {
 		display_notification(_('Material request has been deleted.'));
 		$selected_id = -1;
 	} else {
-		display_error(_('Cannot delete this material request. Only Draft or Cancelled requests can be deleted.'));
+		display_error(_('Cannot delete this material request. Reviewed, linked or retained source evidence must be preserved.'));
 	}
 	$Ajax->activate('mr_list');
 	$Ajax->activate('mr_detail');
@@ -95,10 +146,12 @@ if (isset($_POST['ConvertPO']) && $selected_id > 0) {
 	if (empty($supplier_id)) {
 		display_error(_('Please select a supplier for the purchase order.'));
 	} else {
-		$mr = get_material_request($selected_id);
-		$po_no = convert_material_request_to_po($selected_id, $supplier_id, $mr['warehouse_loc_code']);
-		if ($po_no) {
-			display_notification(sprintf(_('Purchase Order #%d has been created from this material request.'), $po_no));
+		include_once($path_to_root.'/inventory/warehouse/includes/db/warehouse_material_po_approval_db.inc');
+		$result = submit_material_request_purchase_order($selected_id, $supplier_id);
+		if ($result && $result['status'] === 'pending') {
+			display_notification(sprintf(_('Purchase order conversion submitted for approval. Draft #%d.'), $result['draft_id']));
+		} elseif ($result && $result['status'] === 'posted') {
+			display_notification(sprintf(_('Purchase Order #%d has been created from this material request.'), $result['trans_no']));
 		} else {
 			display_error(_('Could not create purchase order. The request may not be in Approved status or have no outstanding lines.'));
 		}
@@ -127,6 +180,10 @@ if (isset($_POST['ConvertTO']) && $selected_id > 0) {
 // --- Save new/edit ---
 if (isset($_POST['ADD_ITEM']) || isset($_POST['UPDATE_ITEM'])) {
 	$input_error = 0;
+	if (isset($_POST['ADD_ITEM']) && isset($_POST['UPDATE_ITEM'])) {
+		display_error(_('Choose one material request command and retry.'));
+		$input_error = 1;
+	}
 
 	if (empty(get_post('request_type'))) {
 		display_error(_('You must select a request type.'));
@@ -137,9 +194,19 @@ if (isset($_POST['ADD_ITEM']) || isset($_POST['UPDATE_ITEM'])) {
 		$input_error = 1;
 	}
 
+	$request_date_input = get_post('request_date', '');
+	$required_date_input = get_post('required_date', '');
+	if (!is_string($request_date_input) || !is_date($request_date_input)) {
+		display_error(_('Enter a valid request date.'));
+		$input_error = 1;
+	}
+	if (!is_string($required_date_input) || ($required_date_input !== '' && !is_date($required_date_input))) {
+		display_error(_('Enter a valid required date, or leave it empty.'));
+		$input_error = 1;
+	}
 	if ($input_error == 0) {
-		$request_date = date2sql(get_post('request_date'));
-		$required_date = get_post('required_date') ? date2sql(get_post('required_date')) : null;
+		$request_date = date2sql($request_date_input);
+		$required_date = $required_date_input !== '' ? date2sql($required_date_input) : null;
 		$reference = get_post('reference');
 		$memo = get_post('memo');
 		$request_type = get_post('request_type');
@@ -151,16 +218,19 @@ if (isset($_POST['ADD_ITEM']) || isset($_POST['UPDATE_ITEM'])) {
 				$request_date, $required_date,
 				$reference, $memo
 			);
-			display_notification(sprintf(_('Material request #%d has been created.'), $new_id));
-			$selected_id = $new_id;
+			if ($new_id) {
+				display_notification(sprintf(_('Material request #%d has been created.'), $new_id));
+				$selected_id = $new_id;
+			} else display_error(_('Cannot create this material request. Reload the form and retry.'));
 		} else {
-			update_material_request(
+			$header_result = update_material_request(
 				$selected_id,
 				$request_type, $warehouse_loc,
 				$request_date, $required_date,
 				$reference, $memo
 			);
-			display_notification(_('Material request has been updated.'));
+			if ($header_result) display_notification(_('Material request has been updated.'));
+			else display_error(_('Cannot update this material request. Reload the current standalone draft and retry.'));
 		}
 	}
 	$Ajax->activate('mr_list');
@@ -179,19 +249,21 @@ if (isset($_POST['AddLine'])) {
 	} elseif ($line_qty <= 0) {
 		display_error(_('Quantity must be positive.'));
 	} elseif ($selected_id > 0) {
-		add_material_request_line(
+		$line_result = add_material_request_line(
 			$selected_id,
 			$line_stock,
 			$line_qty,
 			$line_date,
 			$line_memo
 		);
-		display_notification(_('Line added to material request.'));
+		if ($line_result !== false) display_notification(_('Line added to material request.'));
+		else display_error(_('Cannot add this line. Reload the current draft and retry.'));
 	}
 	$Ajax->activate('mr_detail');
 }
 
 // --- Update line ---
+$material_line_failed_id = 0;
 $update_line_id = find_submit('UpdateLine');
 if ($update_line_id > 0) {
 	$upd_qty = input_num('edit_line_qty_' . $update_line_id);
@@ -199,10 +271,15 @@ if ($update_line_id > 0) {
 	$upd_memo = get_post('edit_line_memo_' . $update_line_id);
 
 	if ($upd_qty <= 0) {
+		$material_line_failed_id = $update_line_id;
 		display_error(_('Quantity must be positive.'));
 	} else {
-		update_material_request_line($update_line_id, $upd_qty, $upd_date, $upd_memo);
-		display_notification(_('Line has been updated.'));
+		if (update_material_request_line($update_line_id, $upd_qty, $upd_date, $upd_memo, $selected_id))
+			display_notification(_('Line has been updated.'));
+		else {
+			$material_line_failed_id = $update_line_id;
+			display_error(_('Cannot update this line. Reload the current draft and retry.'));
+		}
 	}
 	$Ajax->activate('mr_detail');
 }
@@ -210,8 +287,8 @@ if ($update_line_id > 0) {
 // --- Delete line ---
 $del_line = find_submit('DeleteLine');
 if ($del_line > 0) {
-	delete_material_request_line($del_line);
-	display_notification(_('Line removed from material request.'));
+	if (delete_material_request_line($del_line, $selected_id)) display_notification(_('Line removed from material request.'));
+	else display_error(_('Cannot remove this line. Reviewed, linked or retained source evidence must be preserved.'));
 	$Ajax->activate('mr_detail');
 }
 
@@ -240,6 +317,7 @@ if ($is_new_request) {
 // =====================================================================
 
 start_form();
+hidden('material_core_context', get_material_request_core_form_context());
 
 // --- FILTERS ---
 start_table(TABLESTYLE_NOBORDER);
@@ -377,9 +455,9 @@ if ($selected_id > 0 || $is_new_request) {
 
 		table_section(2);
 
-		if ($mr['reference'])
+		if ($mr['reference'] !== null && $mr['reference'] !== '')
 			label_row(_('Reference:'), $mr['reference']);
-		if ($mr['memo'])
+		if ($mr['memo'] !== null && $mr['memo'] !== '')
 			label_row(_('Memo:'), $mr['memo']);
 		label_row(_('Requested By:'), $mr['requested_by_name']);
 		if ($mr['approved_by_name'])
@@ -434,11 +512,19 @@ if ($selected_id > 0 || $is_new_request) {
 
 			if ($editing) {
 				// Editable row
+				$line_quantity_value = number_format2($line['qty_requested'], max(4, get_qty_dec($line['stock_id'])));
+				$line_date_value = $line['required_date'] ? sql2date($line['required_date']) : '';
+				$line_memo_value = $line['memo'] === null ? '' : $line['memo'];
+				if ((int)$line['line_id'] === (int)$material_line_failed_id) {
+					$line_quantity_value = get_post('edit_line_qty_' . $line['line_id'], $line_quantity_value);
+					$line_date_value = get_post('edit_line_date_' . $line['line_id'], $line_date_value);
+					$line_memo_value = get_post('edit_line_memo_' . $line['line_id'], $line_memo_value);
+				}
 				label_cell($line['stock_id']);
 				label_cell($line['item_description']);
 				echo '<td>';
 				echo '<input type="text" name="edit_line_qty_' . $line['line_id']
-					. '" value="' . number_format2($line['qty_requested'], get_qty_dec($line['stock_id']))
+					. '" value="' . htmlspecialchars(is_scalar($line_quantity_value) ? (string)$line_quantity_value : '', ENT_QUOTES, 'UTF-8')
 					. '" size="8" class="amount">';
 				echo '</td>';
 				qty_cell($line['qty_fulfilled']);
@@ -446,12 +532,12 @@ if ($selected_id > 0 || $is_new_request) {
 				label_cell($line['item_units']);
 				echo '<td>';
 				echo '<input type="text" name="edit_line_date_' . $line['line_id']
-					. '" value="' . ($line['required_date'] ? sql2date($line['required_date']) : '')
+					. '" value="' . htmlspecialchars(is_scalar($line_date_value) ? (string)$line_date_value : '', ENT_QUOTES, 'UTF-8')
 					. '" size="12">';
 				echo '</td>';
 				echo '<td>';
 				echo '<input type="text" name="edit_line_memo_' . $line['line_id']
-					. '" value="' . htmlspecialchars($line['memo'] ? $line['memo'] : '', ENT_QUOTES, 'UTF-8')
+					. '" value="' . htmlspecialchars(is_scalar($line_memo_value) ? (string)$line_memo_value : '', ENT_QUOTES, 'UTF-8')
 					. '" size="20">';
 				echo '</td>';
 				echo '<td nowrap>';
@@ -513,6 +599,25 @@ if ($selected_id > 0 || $is_new_request) {
 			submit('Submit', _('Submit for Approval'), true, _('Submit this request for approval'));
 			echo ' ';
 			submit('Delete', _('Delete'), true, _('Delete this material request'));
+		}
+		if ($mr['status'] === 'approved' && $mr['request_type'] === 'transfer'
+			&& (int)$mr['requested_by'] === (int)$_SESSION['wa_current_user']->user
+			&& $_SESSION['wa_current_user']->can_access('SA_TRANSFERORDERS')) {
+			include_once($path_to_root.'/inventory/warehouse/includes/db/warehouse_material_transfer_release_db.inc');
+			$can_request_replacement = false;
+			if (begin_transaction()) {
+				$can_request_replacement = material_released_transfer_custody((int)$selected_id) !== false;
+				if (!commit_transaction()) $can_request_replacement = false;
+			}
+			if ($can_request_replacement)
+				submit('Submit', _('Request Replacement Approval'), true, _('Obtain a new independent approval for this released demand'));
+		}
+
+		if ($mr['status'] === 'ordered' && $mr['request_type'] === 'transfer'
+			&& (int)$mr['linked_doc_type'] === ST_LOCTRANSFER
+			&& (int)$mr['requested_by'] === (int)$_SESSION['wa_current_user']->user
+			&& $_SESSION['wa_current_user']->can_access('SA_TRANSFERORDERS')) {
+			submit('ReleaseTO', _('Release Cancelled Transfer Demand'), true, _('Release only an independently cancelled, unconsumed Transfer'));
 		}
 
 		if ($mr['status'] === 'submitted') {
